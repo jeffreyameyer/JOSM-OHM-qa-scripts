@@ -1,0 +1,9 @@
+[out:xml][timeout:90][bbox:{{bbox}}];
+(
+  nwr["start_date"~"before",i];
+  nwr["start_date"~"after",i];
+  nwr["end_date"~"before",i];
+  nwr["end_date"~"after",i];
+);
+(._;>;);
+out meta;
