@@ -12,7 +12,7 @@ layer = MainApplication.getLayerManager().getEditLayer()
 ds = layer.getDataSet()
 
 commands = []
-date_pattern = re.compile(r'\s*\((\d{4}-(\d{4}|\d{2})?|\d{4})\)')
+date_pattern = re.compile(r'\s*\(\s*(\d{4}\s*-\s*(\d{4}|\d{2})?\s*|\d{4}\s*)\)')
 name_key_pattern = re.compile(r'^name(:[a-z]{2}([_-][a-zA-Z]+)?)?$')
 
 for relation in ds.getRelations():
