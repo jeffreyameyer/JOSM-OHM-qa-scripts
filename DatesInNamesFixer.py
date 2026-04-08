@@ -13,16 +13,19 @@ ds = layer.getDataSet()
 
 commands = []
 date_pattern = re.compile(r'\s*\(\s*(\d{4}\s*-\s*(\d{4}|\d{2})?\s*|\d{4}\s*)\)')
+trailing_date_pattern = re.compile(r'\s\d{4}(-(\d{4}|\d{2})?)?$')
 name_key_pattern = re.compile(r'^name(:[a-z]{2}([_-][a-zA-Z]+)?)?$')
 
 for relation in ds.getRelations():
     for key in relation.keySet():
         if name_key_pattern.match(key):
             value = relation.get(key)
-            if value and date_pattern.search(value):
+            if value:
                 new_value = date_pattern.sub('', value).strip()
-                print(u"{} {}: {} -> {}".format(key, relation.getId(), value, new_value))
-                commands.append(ChangePropertyCommand(relation, key, new_value))
+                new_value = trailing_date_pattern.sub('', new_value).strip()
+                if new_value != value:
+                    print(u"{} {}: {} -> {}".format(key, relation.getId(), value, new_value))
+                    commands.append(ChangePropertyCommand(relation, key, new_value))
 
 if commands:
     getInstance().add(SequenceCommand("Strip dates from relation names", commands))
