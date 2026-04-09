@@ -1,0 +1,52 @@
+# Written by Claude
+# Prompted by Jeff Meyer
+# This changes dates from XX-ZZ-YYYY format to YYYY-MM-DD
+# For selected objects
+# Only when either XX or ZZ is unambiguosly a day value (i.e., >= 13)
+# Please always confirm your changes before uploading to OHM
+
+import re
+from org.openstreetmap.josm.command import ChangePropertyCommand, SequenceCommand
+from org.openstreetmap.josm.gui import MainApplication
+from org.openstreetmap.josm.data.UndoRedoHandler import getInstance
+
+layer = MainApplication.getLayerManager().getEditLayer()
+ds = layer.getDataSet()
+
+commands = []
+pattern = re.compile(r'^(\d{2})-(\d{2})-(\d{4})$')
+
+def fix_date(value):
+    if value is None:
+        return None
+    m = pattern.match(value)
+    if not m:
+        return None
+    xx, zz, yyyy = int(m.group(1)), int(m.group(2)), m.group(3)
+    if xx >= 13 and zz >= 13:
+        # Both > 12 — invalid date either way, skip
+        return None
+    elif xx >= 13:
+        # XX must be DD, ZZ is MM
+        dd, mm = u"{:02d}".format(xx), u"{:02d}".format(zz)
+    elif zz >= 13:
+        # ZZ must be DD, XX is MM
+        dd, mm = u"{:02d}".format(zz), u"{:02d}".format(xx)
+    else:
+        # Both <= 12, ambiguous — skip
+        return None
+    return u"{}-{}-{}".format(yyyy, mm, dd)
+
+for primitive in list(ds.getSelected()):
+    for tag_key in ("start_date", "end_date"):
+        val = primitive.get(tag_key)
+        new_val = fix_date(val)
+        if new_val:
+            print(u"{} [{}]: {} -> {}".format(primitive, tag_key, val, new_val))
+            commands.append(ChangePropertyCommand(primitive, tag_key, new_val))
+
+if commands:
+    getInstance().add(SequenceCommand("Fix DD-MM-YYYY date format to YYYY-MM-DD", commands))
+    print("Done: {} tags updated".format(len(commands)))
+else:
+    print("No matching date tags found")
