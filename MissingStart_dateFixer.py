@@ -19,6 +19,9 @@ for obj in ds.getSelected():
     if obj.isDeleted() or obj.isIncomplete():
         continue
 
+    if obj.get("natural"):
+        continue
+
     end_date = obj.get("end_date")
     start_date = obj.get("start_date")
 
