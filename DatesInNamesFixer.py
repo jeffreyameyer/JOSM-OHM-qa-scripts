@@ -115,12 +115,38 @@ def extract_dates(value):
     all_years = set(normalize_year(y) for y in year_only_re.findall(remaining))
     return {'full': normalized_full, 'year_month': normalized_ym, 'years': all_years}
 
-def dates_match(name_dates, tag_dates):
+def expand_2digit_year(two_digit, start_year_str):
+    """Expand a 2-digit year to 4 digits using the century from start_year."""
+    century = start_year_str[:2]
+    return normalize_year(century + two_digit)
+
+def dates_match(name_dates, tag_dates, name_range=None):
+    """
+    name_range: optional tuple (start_year_str, end_str) where end_str may be
+    a 2-digit abbreviated year that needs century expansion.
+    """
     tag_ym_from_full = set('-'.join(d.split('-')[:2]) for d in tag_dates['full'] if len(d.split('-')) >= 2)
     tag_years_from_full = set(d.split('-')[0] for d in tag_dates['full'] if d)
     tag_years_from_ym = set(ym.split('-')[0] for ym in tag_dates['year_month'] if ym)
     all_tag_yms = tag_dates['year_month'] | tag_ym_from_full
     all_tag_years = tag_dates['years'] | tag_years_from_full | tag_years_from_ym | set(ym.split('-')[0] for ym in all_tag_yms)
+
+    # If we have a 2-digit abbreviated end year, expand it and check if
+    # the start year matches start_date and expanded end year matches end_date
+    if name_range:
+        start_str, end_str = name_range
+        if len(end_str) == 2:
+            expanded_end = expand_2digit_year(end_str, start_str)
+            start_padded = normalize_year(start_str)
+            # start must be in tag years, expanded end must be in tag years
+            start_ok = start_padded in all_tag_years
+            end_ok = expanded_end in all_tag_years
+            if start_ok and end_ok:
+                return True
+            # also allow end to match a year-month or full date prefix
+            end_ok_partial = any(y.startswith(expanded_end) or expanded_end == y for y in all_tag_years)
+            if start_ok and end_ok_partial:
+                return True
 
     if name_dates['full']:
         return name_dates['full'].issubset(tag_dates['full'])
@@ -131,38 +157,52 @@ def dates_match(name_dates, tag_dates):
     return False
 
 def _split_date_range(inner):
-    # strip trailing ~ for approximate year before splitting
-    inner_clean = inner.rstrip('~')
+    """Split a compact date range string into its component date strings.
+    Returns (parts, start_str, end_str) where end_str may be 2-digit."""
+    inner_clean = inner.rstrip('~').strip()
+    # Check for 2-digit abbreviated end year: YYYY-DD where DD < 32 could be
+    # ambiguous, but we handle it by also returning the raw end component
     m = re.match(r'^(\d{1,4}-\d{2}-\d{2})-(\d{1,4}-\d{2}-\d{2})$', inner_clean)
-    if m: return [m.group(1), m.group(2)]
+    if m: return [m.group(1), m.group(2)], None
     m = re.match(r'^(\d{1,4}-\d{2}-\d{2})-(\d{1,4}-\d{2})$', inner_clean)
-    if m: return [m.group(1), m.group(2)]
+    if m: return [m.group(1), m.group(2)], None
     m = re.match(r'^(\d{1,4}-\d{2})-(\d{1,4}-\d{2}-\d{2})$', inner_clean)
-    if m: return [m.group(1), m.group(2)]
+    if m: return [m.group(1), m.group(2)], None
     m = re.match(r'^(\d{1,4}-\d{2}-\d{2})-(\d{1,4})$', inner_clean)
-    if m: return [m.group(1), m.group(2)]
+    if m: return [m.group(1), m.group(2)], None
     m = re.match(r'^(\d{1,4})-(\d{1,4}-\d{2}-\d{2})$', inner_clean)
-    if m: return [m.group(1), m.group(2)]
+    if m: return [m.group(1), m.group(2)], None
     m = re.match(r'^(\d{1,4}-\d{2})-(\d{1,4}-\d{2})$', inner_clean)
-    if m: return [m.group(1), m.group(2)]
+    if m: return [m.group(1), m.group(2)], None
     m = re.match(r'^(\d{1,4}-\d{2})-(\d{1,4})$', inner_clean)
-    if m: return [m.group(1), m.group(2)]
+    if m: return [m.group(1), m.group(2)], None
     m = re.match(r'^(\d{1,4})-(\d{1,4}-\d{2})$', inner_clean)
-    if m: return [m.group(1), m.group(2)]
-    m = re.match(r'^(\d{1,4})-(\d{1,4})$', inner_clean)
-    if m: return [m.group(1), m.group(2)]
+    if m: return [m.group(1), m.group(2)], None
+    # year-to-year: check if end is 2-digit abbreviated
+    m = re.match(r'^(\d{1,4})-(\d{2})$', inner_clean)
+    if m:
+        start = m.group(1)
+        end = m.group(2)
+        expanded = expand_2digit_year(end, normalize_year(start))
+        return [start, expanded], (start, end)
+    m = re.match(r'^(\d{1,4})-(\d{3,4})$', inner_clean)
+    if m: return [m.group(1), m.group(2)], None
     m = re.match(r'^(\d{1,4})-$', inner_clean)
-    if m: return [m.group(1)]
-    return [inner_clean]
+    if m: return [m.group(1)], None
+    return [inner_clean], None
 
 def extract_dates_from_patterns(value):
     dates = {'full': set(), 'year_month': set(), 'years': set()}
+    ranges = []  # collect any 2-digit abbreviated ranges for special handling
     for match in date_pattern.finditer(value):
         inner = match.group().strip().lstrip('(').rstrip(')').strip()
         if ' - ' in inner:
             parts = inner.split(' - ', 1)
+            name_range = None
         else:
-            parts = _split_date_range(inner)
+            parts, name_range = _split_date_range(inner)
+        if name_range:
+            ranges.append(name_range)
         for part in parts:
             part = part.strip().rstrip('-').rstrip('~').strip()
             if part:
@@ -170,7 +210,7 @@ def extract_dates_from_patterns(value):
                 dates['full'].update(d['full'])
                 dates['year_month'].update(d['year_month'])
                 dates['years'].update(d['years'])
-    return dates
+    return dates, ranges
 
 def get_primitive_type(obj):
     from org.openstreetmap.josm.data.osm import Node, Way, Relation
@@ -228,13 +268,23 @@ def process_objects(objects):
                 if not value:
                     continue
 
-                name_dates = extract_dates_from_patterns(value)
+                name_dates, name_ranges = extract_dates_from_patterns(value)
                 if not name_dates['full'] and not name_dates['year_month'] and not name_dates['years']:
                     continue
 
                 new_value = date_pattern.sub('', value).strip()
 
-                if dates_match(name_dates, tag_dates):
+                # Check for 2-digit abbreviated range match first
+                matched = False
+                if name_ranges:
+                    for name_range in name_ranges:
+                        if dates_match(name_dates, tag_dates, name_range=name_range):
+                            matched = True
+                            break
+                if not matched:
+                    matched = dates_match(name_dates, tag_dates)
+
+                if matched:
                     output.append(u"STRIP {} [{}] \"{}\" [{}]: {} -> {}".format(
                         obj_type, obj_id, name, date_tags, value, new_value))
                     commands.append(ChangePropertyCommand(obj, key, new_value))
