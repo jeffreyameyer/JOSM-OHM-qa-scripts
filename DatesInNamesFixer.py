@@ -21,7 +21,52 @@ ds = layer.getDataSet()
 
 commands = []
 output = []
-date_pattern = re.compile(r'\s*\(\s*(\d{1,4}[-/]\d{2}[-/]\d{2}\s*-\s*(\d{1,4}[-/]\d{2}[-/]\d{2})?\s*|\d{1,4}[-/]\d{2}\s*-\s*(\d{1,4}[-/]\d{2})?\s*|\d{1,4}\s*-\s*(\d{1,4}|\d{2})?\s*|\d{1,4}[-/]\d{2}[-/]\d{2}\s*|\d{1,4}[-/]\d{2}\s*|\d{1,4}\s*)\)')
+
+date_pattern = re.compile(r"""
+    \s*\(\s*
+    (?:
+        # full date to full date: 1776-07-04-1880-10-01
+        \d{1,4}-\d{2}-\d{2}\s*-\s*\d{1,4}-\d{2}-\d{2}
+        |
+        # full date to year-month: 1776-07-04-1880-10
+        \d{1,4}-\d{2}-\d{2}\s*-\s*\d{1,4}-\d{2}
+        |
+        # year-month to full date: 1776-07-1880-10-01
+        \d{1,4}-\d{2}\s*-\s*\d{1,4}-\d{2}-\d{2}
+        |
+        # full date to year: 1776-07-04-1880
+        \d{1,4}-\d{2}-\d{2}\s*-\s*\d{1,4}
+        |
+        # year to full date: 1776-1880-07-04
+        \d{1,4}\s*-\s*\d{1,4}-\d{2}-\d{2}
+        |
+        # full date only: 1776-07-04
+        \d{1,4}-\d{2}-\d{2}
+        |
+        # year-month to year-month: 1776-07-1880-10
+        \d{1,4}-\d{2}\s*-\s*\d{1,4}-\d{2}
+        |
+        # year-month to year: 1776-07-1880
+        \d{1,4}-\d{2}\s*-\s*\d{1,4}
+        |
+        # year to year-month: 1776-1880-07
+        \d{1,4}\s*-\s*\d{1,4}-\d{2}
+        |
+        # year-month only: 1776-07
+        \d{1,4}-\d{2}
+        |
+        # year to year: 1776-1880
+        \d{1,4}\s*-\s*\d{1,4}
+        |
+        # year with open end: 1776-
+        \d{1,4}\s*-\s*
+        |
+        # year only: 1776
+        \d{1,4}
+    )
+    \s*\)
+""", re.VERBOSE)
+
 name_key_pattern = re.compile(r'^name(:[a-z]{2}([_-][a-zA-Z]+)?)?$')
 full_date_re = re.compile(r'\d{1,4}[-/]\d{2}[-/]\d{2}')
 year_month_re = re.compile(r'\d{1,4}[-/]\d{2}(?![-/]\d{2})')
@@ -46,10 +91,8 @@ def normalize_date_tag(value):
     return value
 
 def extract_dates(value):
-    """Extract full dates, year-month pairs, and years from a string."""
     if not value:
         return {'full': set(), 'year_month': set(), 'years': set()}
-    # full dates e.g. 1495-05-06
     full_dates = set(full_date_re.findall(value))
     normalized_full = set()
     for d in full_dates:
@@ -57,7 +100,6 @@ def extract_dates(value):
         parts = d.split('-')
         parts[0] = normalize_year(parts[0])
         normalized_full.add('-'.join(parts))
-    # year-month pairs e.g. 1495-05 (not followed by another -DD)
     year_months = set(year_month_re.findall(value))
     normalized_ym = set()
     for ym in year_months:
@@ -65,47 +107,64 @@ def extract_dates(value):
         parts = ym.split('-')
         parts[0] = normalize_year(parts[0])
         normalized_ym.add('-'.join(parts))
-    # years only
-    # exclude numbers that are part of full dates or year-month pairs
     remaining = full_date_re.sub('', value)
     remaining = year_month_re.sub('', remaining)
     all_years = set(normalize_year(y) for y in year_only_re.findall(remaining))
     return {'full': normalized_full, 'year_month': normalized_ym, 'years': all_years}
 
 def dates_match(name_dates, tag_dates):
-    """
-    Match name dates against tag dates with partial date support:
-    - full date in name matches full date in tag
-    - year-month in name matches if tag has a full date with same year-month prefix
-    - year in name matches if tag has a full date, year-month, or year with same year
-    """
-    # extract year-month prefixes from tag full dates for partial matching
-    tag_ym_from_full = set('-'.join(d.split('-')[:2]) for d in tag_dates['full'])
-    tag_years_from_full = set(d.split('-')[0] for d in tag_dates['full'])
-    tag_years_from_ym = set(ym.split('-')[0] for ym in tag_dates['year_month'])
+    tag_ym_from_full = set('-'.join(d.split('-')[:2]) for d in tag_dates['full'] if len(d.split('-')) >= 2)
+    tag_years_from_full = set(d.split('-')[0] for d in tag_dates['full'] if d)
+    tag_years_from_ym = set(ym.split('-')[0] for ym in tag_dates['year_month'] if ym)
+    all_tag_yms = tag_dates['year_month'] | tag_ym_from_full
+    all_tag_years = tag_dates['years'] | tag_years_from_full | tag_years_from_ym | set(ym.split('-')[0] for ym in all_tag_yms)
 
     if name_dates['full']:
         return name_dates['full'].issubset(tag_dates['full'])
-
     if name_dates['year_month']:
-        # year-month in name matches full date or year-month in tag
-        all_tag_yms = tag_dates['year_month'] | tag_ym_from_full
         return name_dates['year_month'].issubset(all_tag_yms)
-
     if name_dates['years']:
-        # year in name matches full date, year-month, or year in tag
-        all_tag_years = tag_dates['years'] | tag_years_from_full | tag_years_from_ym
         return name_dates['years'].issubset(all_tag_years)
-
     return False
+
+def _split_date_range(inner):
+    m = re.match(r'^(\d{1,4}-\d{2}-\d{2})-(\d{1,4}-\d{2}-\d{2})$', inner)
+    if m: return [m.group(1), m.group(2)]
+    m = re.match(r'^(\d{1,4}-\d{2}-\d{2})-(\d{1,4}-\d{2})$', inner)
+    if m: return [m.group(1), m.group(2)]
+    m = re.match(r'^(\d{1,4}-\d{2})-(\d{1,4}-\d{2}-\d{2})$', inner)
+    if m: return [m.group(1), m.group(2)]
+    m = re.match(r'^(\d{1,4}-\d{2}-\d{2})-(\d{1,4})$', inner)
+    if m: return [m.group(1), m.group(2)]
+    m = re.match(r'^(\d{1,4})-(\d{1,4}-\d{2}-\d{2})$', inner)
+    if m: return [m.group(1), m.group(2)]
+    m = re.match(r'^(\d{1,4}-\d{2})-(\d{1,4}-\d{2})$', inner)
+    if m: return [m.group(1), m.group(2)]
+    m = re.match(r'^(\d{1,4}-\d{2})-(\d{1,4})$', inner)
+    if m: return [m.group(1), m.group(2)]
+    m = re.match(r'^(\d{1,4})-(\d{1,4}-\d{2})$', inner)
+    if m: return [m.group(1), m.group(2)]
+    m = re.match(r'^(\d{1,4})-(\d{1,4})$', inner)
+    if m: return [m.group(1), m.group(2)]
+    m = re.match(r'^(\d{1,4})-$', inner)
+    if m: return [m.group(1)]
+    return [inner]
 
 def extract_dates_from_patterns(value):
     dates = {'full': set(), 'year_month': set(), 'years': set()}
     for match in date_pattern.finditer(value):
-        d = extract_dates(match.group())
-        dates['full'].update(d['full'])
-        dates['year_month'].update(d['year_month'])
-        dates['years'].update(d['years'])
+        inner = match.group().strip().lstrip('(').rstrip(')').strip()
+        if ' - ' in inner:
+            parts = inner.split(' - ', 1)
+        else:
+            parts = _split_date_range(inner)
+        for part in parts:
+            part = part.strip().rstrip('-').strip()
+            if part:
+                d = extract_dates(part)
+                dates['full'].update(d['full'])
+                dates['year_month'].update(d['year_month'])
+                dates['years'].update(d['years'])
     return dates
 
 def get_primitive_type(obj):
@@ -118,6 +177,14 @@ def get_primitive_type(obj):
         return "relation"
     return "unknown"
 
+def format_date_tags(start_date, end_date):
+    parts = []
+    if start_date:
+        parts.append(u"start_date={}".format(start_date))
+    if end_date:
+        parts.append(u"end_date={}".format(end_date))
+    return u" | ".join(parts)
+
 def process_objects(objects):
     for obj in objects:
         start_date = obj.get("start_date")
@@ -129,18 +196,17 @@ def process_objects(objects):
         obj_id = obj.getId()
         obj_type = get_primitive_type(obj)
         name = obj.get("name") or u""
+        date_tags = format_date_tags(start_date, end_date)
 
-        # Fix zero-padding in start_date and end_date if needed
         for tag in ["start_date", "end_date"]:
             tag_value = obj.get(tag)
             if tag_value:
                 normalized = normalize_date_tag(tag_value)
                 if normalized != tag_value:
-                    output.append(u"PAD {} [{}] \"{}\": {} {} -> {}".format(
-                        obj_type, obj_id, name, tag, tag_value, normalized))
+                    output.append(u"PAD {} [{}] \"{}\" [{}]: {} {} -> {}".format(
+                        obj_type, obj_id, name, date_tags, tag, tag_value, normalized))
                     commands.append(ChangePropertyCommand(obj, tag, normalized))
 
-        # Use normalized values for comparison
         start_date_norm = normalize_date_tag(start_date)
         end_date_norm = normalize_date_tag(end_date)
 
@@ -164,12 +230,12 @@ def process_objects(objects):
                 new_value = date_pattern.sub('', value).strip()
 
                 if dates_match(name_dates, tag_dates):
-                    output.append(u"STRIP {} [{}] \"{}\": {} -> {}".format(
-                        obj_type, obj_id, name, value, new_value))
+                    output.append(u"STRIP {} [{}] \"{}\" [{}]: {} -> {}".format(
+                        obj_type, obj_id, name, date_tags, value, new_value))
                     commands.append(ChangePropertyCommand(obj, key, new_value))
                 else:
-                    output.append(u"MISMATCH {} [{}] \"{}\": name dates={} start/end_date dates={}".format(
-                        obj_type, obj_id, name, name_dates, tag_dates))
+                    output.append(u"MISMATCH {} [{}] \"{}\" [{}]: name dates={} tag dates={}".format(
+                        obj_type, obj_id, name, date_tags, name_dates, tag_dates))
                     commands.append(ChangePropertyCommand(obj, "name:fixme",
                         "double-check the dates in the name tag and make sure they match the start_date and end_date tags. It is impossible to know which are correct without further research."))
 
@@ -183,7 +249,6 @@ if commands:
 else:
     output.append(u"No matching objects found")
 
-# Display output in a scrollable, copyable dialog
 text_area = JTextArea("\n".join(output))
 text_area.setEditable(False)
 scroll_pane = JScrollPane(text_area)
