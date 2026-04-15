@@ -61,6 +61,9 @@ date_pattern = re.compile(r"""
         # year with open end: 1776-
         \d{1,4}\s*-\s*
         |
+        # approximate year: 1776~
+        \d{1,4}~
+        |
         # year only: 1776
         \d{1,4}
     )
@@ -128,27 +131,29 @@ def dates_match(name_dates, tag_dates):
     return False
 
 def _split_date_range(inner):
-    m = re.match(r'^(\d{1,4}-\d{2}-\d{2})-(\d{1,4}-\d{2}-\d{2})$', inner)
+    # strip trailing ~ for approximate year before splitting
+    inner_clean = inner.rstrip('~')
+    m = re.match(r'^(\d{1,4}-\d{2}-\d{2})-(\d{1,4}-\d{2}-\d{2})$', inner_clean)
     if m: return [m.group(1), m.group(2)]
-    m = re.match(r'^(\d{1,4}-\d{2}-\d{2})-(\d{1,4}-\d{2})$', inner)
+    m = re.match(r'^(\d{1,4}-\d{2}-\d{2})-(\d{1,4}-\d{2})$', inner_clean)
     if m: return [m.group(1), m.group(2)]
-    m = re.match(r'^(\d{1,4}-\d{2})-(\d{1,4}-\d{2}-\d{2})$', inner)
+    m = re.match(r'^(\d{1,4}-\d{2})-(\d{1,4}-\d{2}-\d{2})$', inner_clean)
     if m: return [m.group(1), m.group(2)]
-    m = re.match(r'^(\d{1,4}-\d{2}-\d{2})-(\d{1,4})$', inner)
+    m = re.match(r'^(\d{1,4}-\d{2}-\d{2})-(\d{1,4})$', inner_clean)
     if m: return [m.group(1), m.group(2)]
-    m = re.match(r'^(\d{1,4})-(\d{1,4}-\d{2}-\d{2})$', inner)
+    m = re.match(r'^(\d{1,4})-(\d{1,4}-\d{2}-\d{2})$', inner_clean)
     if m: return [m.group(1), m.group(2)]
-    m = re.match(r'^(\d{1,4}-\d{2})-(\d{1,4}-\d{2})$', inner)
+    m = re.match(r'^(\d{1,4}-\d{2})-(\d{1,4}-\d{2})$', inner_clean)
     if m: return [m.group(1), m.group(2)]
-    m = re.match(r'^(\d{1,4}-\d{2})-(\d{1,4})$', inner)
+    m = re.match(r'^(\d{1,4}-\d{2})-(\d{1,4})$', inner_clean)
     if m: return [m.group(1), m.group(2)]
-    m = re.match(r'^(\d{1,4})-(\d{1,4}-\d{2})$', inner)
+    m = re.match(r'^(\d{1,4})-(\d{1,4}-\d{2})$', inner_clean)
     if m: return [m.group(1), m.group(2)]
-    m = re.match(r'^(\d{1,4})-(\d{1,4})$', inner)
+    m = re.match(r'^(\d{1,4})-(\d{1,4})$', inner_clean)
     if m: return [m.group(1), m.group(2)]
-    m = re.match(r'^(\d{1,4})-$', inner)
+    m = re.match(r'^(\d{1,4})-$', inner_clean)
     if m: return [m.group(1)]
-    return [inner]
+    return [inner_clean]
 
 def extract_dates_from_patterns(value):
     dates = {'full': set(), 'year_month': set(), 'years': set()}
@@ -159,7 +164,7 @@ def extract_dates_from_patterns(value):
         else:
             parts = _split_date_range(inner)
         for part in parts:
-            part = part.strip().rstrip('-').strip()
+            part = part.strip().rstrip('-').rstrip('~').strip()
             if part:
                 d = extract_dates(part)
                 dates['full'].update(d['full'])
