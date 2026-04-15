@@ -21,10 +21,10 @@ ds = layer.getDataSet()
 
 commands = []
 output = []
-date_pattern = re.compile(r'\s*\(\s*(\d{4}[-/]\d{2}[-/]\d{2}\s*-\s*(\d{4}[-/]\d{2}[-/]\d{2})?\s*|\d{1,4}\s*-\s*(\d{1,4}|\d{2})?\s*|\d{4}[-/]\d{2}[-/]\d{2}\s*|\d{1,4}\s*)\)')
-trailing_date_pattern = re.compile(r'\s(\d{4}[-/]\d{2}[-/]\d{2}|\d{1,4})(-(\d{4}[-/]\d{2}[-/]\d{2}|\d{1,4}|\d{2})?)?$')
+date_pattern = re.compile(r'\s*\(\s*(\d{1,4}[-/]\d{2}[-/]\d{2}\s*-\s*(\d{1,4}[-/]\d{2}[-/]\d{2})?\s*|\d{1,4}[-/]\d{2}\s*-\s*(\d{1,4}[-/]\d{2})?\s*|\d{1,4}\s*-\s*(\d{1,4}|\d{2})?\s*|\d{1,4}[-/]\d{2}[-/]\d{2}\s*|\d{1,4}[-/]\d{2}\s*|\d{1,4}\s*)\)')
 name_key_pattern = re.compile(r'^name(:[a-z]{2}([_-][a-zA-Z]+)?)?$')
 full_date_re = re.compile(r'\d{1,4}[-/]\d{2}[-/]\d{2}')
+year_month_re = re.compile(r'\d{1,4}[-/]\d{2}(?![-/]\d{2})')
 year_only_re = re.compile(r'\b\d{1,4}\b')
 unpadded_full_date_re = re.compile(r'^\s*(\d{1,3})([-/]\d{2}[-/]\d{2})\s*$')
 unpadded_year_re = re.compile(r'^\s*(\d{1,3})\s*$')
@@ -46,8 +46,10 @@ def normalize_date_tag(value):
     return value
 
 def extract_dates(value):
+    """Extract full dates, year-month pairs, and years from a string."""
     if not value:
-        return {'full': set(), 'years': set()}
+        return {'full': set(), 'year_month': set(), 'years': set()}
+    # full dates e.g. 1495-05-06
     full_dates = set(full_date_re.findall(value))
     normalized_full = set()
     for d in full_dates:
@@ -55,24 +57,54 @@ def extract_dates(value):
         parts = d.split('-')
         parts[0] = normalize_year(parts[0])
         normalized_full.add('-'.join(parts))
-    all_years = set(normalize_year(y) for y in year_only_re.findall(value))
-    return {'full': normalized_full, 'years': all_years}
+    # year-month pairs e.g. 1495-05 (not followed by another -DD)
+    year_months = set(year_month_re.findall(value))
+    normalized_ym = set()
+    for ym in year_months:
+        ym = ym.replace('/', '-')
+        parts = ym.split('-')
+        parts[0] = normalize_year(parts[0])
+        normalized_ym.add('-'.join(parts))
+    # years only
+    # exclude numbers that are part of full dates or year-month pairs
+    remaining = full_date_re.sub('', value)
+    remaining = year_month_re.sub('', remaining)
+    all_years = set(normalize_year(y) for y in year_only_re.findall(remaining))
+    return {'full': normalized_full, 'year_month': normalized_ym, 'years': all_years}
 
 def dates_match(name_dates, tag_dates):
+    """
+    Match name dates against tag dates with partial date support:
+    - full date in name matches full date in tag
+    - year-month in name matches if tag has a full date with same year-month prefix
+    - year in name matches if tag has a full date, year-month, or year with same year
+    """
+    # extract year-month prefixes from tag full dates for partial matching
+    tag_ym_from_full = set('-'.join(d.split('-')[:2]) for d in tag_dates['full'])
+    tag_years_from_full = set(d.split('-')[0] for d in tag_dates['full'])
+    tag_years_from_ym = set(ym.split('-')[0] for ym in tag_dates['year_month'])
+
     if name_dates['full']:
-        return name_dates['full'].issubset(tag_dates['full']) or name_dates['full'] == tag_dates['full']
-    else:
-        return name_dates['years'].issubset(tag_dates['years']) or name_dates['years'] == tag_dates['years']
+        return name_dates['full'].issubset(tag_dates['full'])
+
+    if name_dates['year_month']:
+        # year-month in name matches full date or year-month in tag
+        all_tag_yms = tag_dates['year_month'] | tag_ym_from_full
+        return name_dates['year_month'].issubset(all_tag_yms)
+
+    if name_dates['years']:
+        # year in name matches full date, year-month, or year in tag
+        all_tag_years = tag_dates['years'] | tag_years_from_full | tag_years_from_ym
+        return name_dates['years'].issubset(all_tag_years)
+
+    return False
 
 def extract_dates_from_patterns(value):
-    dates = {'full': set(), 'years': set()}
+    dates = {'full': set(), 'year_month': set(), 'years': set()}
     for match in date_pattern.finditer(value):
         d = extract_dates(match.group())
         dates['full'].update(d['full'])
-        dates['years'].update(d['years'])
-    for match in trailing_date_pattern.finditer(value):
-        d = extract_dates(match.group())
-        dates['full'].update(d['full'])
+        dates['year_month'].update(d['year_month'])
         dates['years'].update(d['years'])
     return dates
 
@@ -112,10 +144,11 @@ def process_objects(objects):
         start_date_norm = normalize_date_tag(start_date)
         end_date_norm = normalize_date_tag(end_date)
 
-        tag_dates = {'full': set(), 'years': set()}
+        tag_dates = {'full': set(), 'year_month': set(), 'years': set()}
         for tag_value in [start_date_norm, end_date_norm]:
             d = extract_dates(tag_value)
             tag_dates['full'].update(d['full'])
+            tag_dates['year_month'].update(d['year_month'])
             tag_dates['years'].update(d['years'])
 
         for key in obj.keySet():
@@ -125,11 +158,10 @@ def process_objects(objects):
                     continue
 
                 name_dates = extract_dates_from_patterns(value)
-                if not name_dates['full'] and not name_dates['years']:
+                if not name_dates['full'] and not name_dates['year_month'] and not name_dates['years']:
                     continue
 
                 new_value = date_pattern.sub('', value).strip()
-                new_value = trailing_date_pattern.sub('', new_value).strip()
 
                 if dates_match(name_dates, tag_dates):
                     output.append(u"STRIP {} [{}] \"{}\": {} -> {}".format(
@@ -155,5 +187,5 @@ else:
 text_area = JTextArea("\n".join(output))
 text_area.setEditable(False)
 scroll_pane = JScrollPane(text_area)
-scroll_pane.setPreferredSize(Dimension(800, 400))
+scroll_pane.setPreferredSize(Dimension(600, 400))
 JOptionPane.showMessageDialog(None, scroll_pane, "Strip Dates from Names", JOptionPane.INFORMATION_MESSAGE)
