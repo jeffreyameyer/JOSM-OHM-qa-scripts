@@ -22,7 +22,7 @@
 # - matched objects get wikidata/name:en/wikipedia tags
 # - unmatched objects become stream + waterway:source=no wikidata match
 # - for all reviewed waterway=river objects:
-#     * delete level if level=-1
+#     * delete layer if layer=-1
 #     * if source and source_ref both exist:
 #         source:name = old source
 #         source = old source_ref
@@ -476,8 +476,8 @@ def get_common_cleanup_preview_bits(obj):
     bits = []
     tags = obj.getKeys()
 
-    if tags.get("level") == "-1":
-        bits.append("delete level=-1")
+    if tags.get("layer") == "-1":
+        bits.append("delete layer=-1")
 
     if tags.containsKey("source") and tags.containsKey("source_ref"):
         bits.append("rename source->source:name and source_ref->source")
@@ -575,11 +575,11 @@ def add_nomatch_plan_entries(plan, preview, objs, grouped_label=None):
 def append_common_cleanup_commands(commands, obj):
     tags = obj.getKeys()
 
-    if tags.get("level") == "-1":
+    if tags.get("layer") == "-1":
         commands.append(
             ChangePropertyCommand(
                 Collections.singleton(obj),
-                "level",
+                "layer",
                 None
             )
         )
@@ -617,8 +617,8 @@ def build_common_cleanup_summary_bits(obj):
     bits = []
     tags = obj.getKeys()
 
-    if tags.get("level") == "-1":
-        bits.append("deleted level=-1")
+    if tags.get("layer") == "-1":
+        bits.append("deleted layer=-1")
 
     if tags.containsKey("source") and tags.containsKey("source_ref"):
         bits.append("changed source->source:name and source_ref->source")
