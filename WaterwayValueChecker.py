@@ -10,6 +10,7 @@
 
 # JOSM Scripting Plugin - Python (Jython)
 # Japan waterway cleanup with:
+# - live progress dialog for Wikidata calls
 # - skip objects already marked waterway:botcheck=yes
 # - mark all reviewed objects with waterway:botcheck=yes
 # - unique name:ja grouping
@@ -22,7 +23,7 @@
 # - matched objects get wikidata/name:en/wikipedia tags
 # - unmatched objects become stream + waterway:source=no wikidata match
 # - for all reviewed waterway=river objects:
-#     * delete layer if layer=-1
+#     * delete level if level=-1
 #     * if source and source_ref both exist:
 #         source:name = old source
 #         source = old source_ref
@@ -32,8 +33,11 @@ from java.net import URL, URLEncoder
 from java.io import BufferedReader, InputStreamReader
 from java.util import Collections
 from java.lang import Thread
-from javax.swing import JOptionPane, JTextArea, JScrollPane
-from java.awt import Dimension
+from javax.swing import (
+    JOptionPane, JTextArea, JScrollPane, JDialog,
+    SwingUtilities
+)
+from java.awt import Dimension, BorderLayout
 from math import radians, sin, cos, sqrt, atan2
 import json
 
@@ -60,6 +64,9 @@ SEARCH_CACHE = {}
 ENTITY_CACHE = {}
 GROUP_MATCH_CACHE = {}
 
+PROGRESS_DIALOG = None
+PROGRESS_TEXT_AREA = None
+
 
 def should_skip(obj):
     tags = obj.getKeys()
@@ -68,6 +75,48 @@ def should_skip(obj):
 
 def sleep_ms(ms):
     Thread.sleep(ms)
+
+
+def get_parent_component():
+    try:
+        return MainApplication.getMainFrame()
+    except:
+        return None
+
+
+def init_progress_dialog():
+    global PROGRESS_DIALOG, PROGRESS_TEXT_AREA
+
+    PROGRESS_TEXT_AREA = JTextArea()
+    PROGRESS_TEXT_AREA.setEditable(False)
+    PROGRESS_TEXT_AREA.setLineWrap(False)
+
+    scroll = JScrollPane(PROGRESS_TEXT_AREA)
+    scroll.setPreferredSize(Dimension(950, 260))
+
+    PROGRESS_DIALOG = JDialog(get_parent_component(), "Wikidata Progress", False)
+    PROGRESS_DIALOG.getContentPane().setLayout(BorderLayout())
+    PROGRESS_DIALOG.getContentPane().add(scroll, BorderLayout.CENTER)
+    PROGRESS_DIALOG.pack()
+    PROGRESS_DIALOG.setLocationRelativeTo(get_parent_component())
+    PROGRESS_DIALOG.setVisible(True)
+
+
+def append_progress_line(text):
+    global PROGRESS_TEXT_AREA
+    if PROGRESS_TEXT_AREA is None:
+        return
+
+    PROGRESS_TEXT_AREA.append(text + "\n")
+    PROGRESS_TEXT_AREA.setCaretPosition(PROGRESS_TEXT_AREA.getDocument().getLength())
+    PROGRESS_TEXT_AREA.repaint()
+
+
+def close_progress_dialog():
+    global PROGRESS_DIALOG
+    if PROGRESS_DIALOG is not None:
+        PROGRESS_DIALOG.dispose()
+        PROGRESS_DIALOG = None
 
 
 def read_stream(stream):
@@ -81,16 +130,19 @@ def read_stream(stream):
     return "".join(lines)
 
 
-def http_get_json(url):
+def http_get_json(url, log_label=None):
     attempt = 0
     backoff_ms = 1000
+
+    if log_label:
+        append_progress_line(log_label)
 
     while attempt < MAX_RETRIES:
         try:
             conn = URL(url).openConnection()
             conn.setRequestProperty(
                 "User-Agent",
-                "JOSM Japan waterway matcher/1.6 (semi-automated cleanup)"
+                "JOSM Japan waterway matcher/1.7 (semi-automated cleanup)"
             )
             conn.setRequestProperty("Accept", "application/json")
             conn.setConnectTimeout(15000)
@@ -111,11 +163,17 @@ def http_get_json(url):
                         wait_ms = int(retry_after) * 1000
                     except:
                         pass
+                append_progress_line(
+                    "Wikidata rate-limited (429). Waiting %s ms before retry..." % wait_ms
+                )
                 sleep_ms(wait_ms)
                 backoff_ms = backoff_ms * 2
                 attempt += 1
 
             elif code >= 500:
+                append_progress_line(
+                    "Wikidata server error (%s). Retrying..." % code
+                )
                 sleep_ms(backoff_ms)
                 backoff_ms = backoff_ms * 2
                 attempt += 1
@@ -128,10 +186,11 @@ def http_get_json(url):
                     pass
                 raise Exception("HTTP %s for URL %s %s" % (code, url, err))
 
-        except Exception:
+        except Exception as e:
             attempt += 1
             if attempt >= MAX_RETRIES:
                 raise
+            append_progress_line("Request failed; retrying: %s" % str(e))
             sleep_ms(backoff_ms)
             backoff_ms = backoff_ms * 2
 
@@ -157,7 +216,10 @@ def search_candidates(name, lang):
         "&maxlag=5"
     ) % (encoded, encoded_lang)
 
-    data = http_get_json(url)
+    data = http_get_json(
+        url,
+        "Searching Wikidata for %s name=%s" % (lang, name)
+    )
     results = data.get("search", [])
     SEARCH_CACHE[key] = results
     return results
@@ -189,7 +251,10 @@ def get_entities_batch(qids):
             "&maxlag=5"
         ) % encoded_ids
 
-        data = http_get_json(url)
+        data = http_get_json(
+            url,
+            "Fetching Wikidata entities batch: %s" % ids
+        )
         entities = data.get("entities", {})
 
         for qid in batch:
@@ -476,8 +541,8 @@ def get_common_cleanup_preview_bits(obj):
     bits = []
     tags = obj.getKeys()
 
-    if tags.get("layer") == "-1":
-        bits.append("delete layer=-1")
+    if tags.get("level") == "-1":
+        bits.append("delete level=-1")
 
     if tags.containsKey("source") and tags.containsKey("source_ref"):
         bits.append("rename source->source:name and source_ref->source")
@@ -575,11 +640,11 @@ def add_nomatch_plan_entries(plan, preview, objs, grouped_label=None):
 def append_common_cleanup_commands(commands, obj):
     tags = obj.getKeys()
 
-    if tags.get("layer") == "-1":
+    if tags.get("level") == "-1":
         commands.append(
             ChangePropertyCommand(
                 Collections.singleton(obj),
-                "layer",
+                "level",
                 None
             )
         )
@@ -617,8 +682,8 @@ def build_common_cleanup_summary_bits(obj):
     bits = []
     tags = obj.getKeys()
 
-    if tags.get("layer") == "-1":
-        bits.append("deleted layer=-1")
+    if tags.get("level") == "-1":
+        bits.append("deleted level=-1")
 
     if tags.containsKey("source") and tags.containsKey("source_ref"):
         bits.append("changed source->source:name and source_ref->source")
@@ -627,185 +692,212 @@ def build_common_cleanup_summary_bits(obj):
 
 
 def process():
-    layer = MainApplication.getLayerManager().getEditLayer()
+    init_progress_dialog()
+    append_progress_line("Starting review of selected waterways...")
 
-    if layer is None:
-        show_summary_dialog(["No active edit layer."])
-        return
+    try:
+        layer = MainApplication.getLayerManager().getEditLayer()
 
-    selected = list(layer.data.getSelected())
+        if layer is None:
+            close_progress_dialog()
+            show_summary_dialog(["No active edit layer."])
+            return
 
-    if not selected:
-        show_summary_dialog(["No selected objects."])
-        return
+        selected = list(layer.data.getSelected())
 
-    grouped_by_name_ja, singles, skipped = group_objects(selected)
+        if not selected:
+            close_progress_dialog()
+            show_summary_dialog(["No selected objects."])
+            return
 
-    plan = []
-    preview = []
+        grouped_by_name_ja, singles, skipped = group_objects(selected)
 
-    group_keys = list(grouped_by_name_ja.keys())
-    group_keys.sort()
+        plan = []
+        preview = []
 
-    for name_ja in group_keys:
-        objs = grouped_by_name_ja[name_ja]
-        match = find_best_match_for_group(name_ja, objs)
+        group_keys = list(grouped_by_name_ja.keys())
+        group_keys.sort()
 
-        if match:
-            add_match_plan_entries(plan, preview, objs, match, grouped_label=name_ja)
-        else:
-            add_nomatch_plan_entries(plan, preview, objs, grouped_label=name_ja)
+        append_progress_line("Unique name:ja groups to resolve: %s" % len(group_keys))
+        append_progress_line("Single unnamed-ja rivers to resolve individually: %s" % len(singles))
+        append_progress_line("Skipped due to waterway:botcheck=yes: %s" % len(skipped))
 
-    for obj in singles:
-        match = find_best_match_for_obj(obj)
+        for name_ja in group_keys:
+            objs = grouped_by_name_ja[name_ja]
+            append_progress_line(
+                "Resolving grouped name:ja '%s' for %s object(s)..." % (name_ja, len(objs))
+            )
+            match = find_best_match_for_group(name_ja, objs)
 
-        if match:
-            add_match_plan_entries(plan, preview, [obj], match)
-        else:
-            add_nomatch_plan_entries(plan, preview, [obj])
+            if match:
+                add_match_plan_entries(plan, preview, objs, match, grouped_label=name_ja)
+            else:
+                add_nomatch_plan_entries(plan, preview, objs, grouped_label=name_ja)
 
-    if not plan:
+        for obj in singles:
+            append_progress_line(
+                "Resolving single object '%s'..." % get_name(obj.getKeys())
+            )
+            match = find_best_match_for_obj(obj)
+
+            if match:
+                add_match_plan_entries(plan, preview, [obj], match)
+            else:
+                add_nomatch_plan_entries(plan, preview, [obj])
+
+        append_progress_line("Finished Wikidata lookups.")
+
+        close_progress_dialog()
+
+        if not plan:
+            show_summary_dialog([
+                "No selected river objects found to review.",
+                "Skipped due to waterway:botcheck=yes: %s" % len(skipped)
+            ])
+            return
+
+        preview.insert(0, "Total proposed changes: %s" % len(plan))
+        preview.insert(1, "Skipped due to waterway:botcheck=yes: %s" % len(skipped))
+        preview.insert(2, "-" * 110)
+
+        result = show_preview_dialog(preview)
+
+        if result != JOptionPane.OK_OPTION:
+            show_summary_dialog(["Operation cancelled. No changes applied."])
+            return
+
+        summary = []
+        command_count = 0
+
+        for item in plan:
+            commands = []
+
+            if item[0] == "match":
+                _, obj, qid, en_label, enwiki_title, jawiki_title = item
+                name = get_name(obj.getKeys())
+                common_bits = build_common_cleanup_summary_bits(obj)
+
+                append_common_cleanup_commands(commands, obj)
+
+                commands.append(
+                    ChangePropertyCommand(
+                        Collections.singleton(obj),
+                        "wikidata",
+                        qid
+                    )
+                )
+
+                if en_label:
+                    commands.append(
+                        ChangePropertyCommand(
+                            Collections.singleton(obj),
+                            "name:en",
+                            en_label
+                        )
+                    )
+
+                if enwiki_title:
+                    commands.append(
+                        ChangePropertyCommand(
+                            Collections.singleton(obj),
+                            "wikipedia",
+                            "en:%s" % enwiki_title
+                        )
+                    )
+
+                if jawiki_title:
+                    commands.append(
+                        ChangePropertyCommand(
+                            Collections.singleton(obj),
+                            "wikipedia:ja",
+                            jawiki_title
+                        )
+                    )
+
+                commands.append(
+                    ChangePropertyCommand(
+                        Collections.singleton(obj),
+                        "waterway:botcheck",
+                        "yes"
+                    )
+                )
+
+                summary_bits = ["wikidata=%s" % qid, "waterway:botcheck=yes"]
+
+                if en_label:
+                    summary_bits.append("name:en=%s" % en_label)
+                if enwiki_title:
+                    summary_bits.append("wikipedia=en:%s" % enwiki_title)
+                if jawiki_title:
+                    summary_bits.append("wikipedia:ja=%s" % jawiki_title)
+
+                summary_bits.extend(common_bits)
+
+                summary.append(
+                    "%s -> kept river ; %s"
+                    % (name, " ; ".join(summary_bits))
+                )
+
+            else:
+                _, obj = item
+                name = get_name(obj.getKeys())
+                common_bits = build_common_cleanup_summary_bits(obj)
+
+                append_common_cleanup_commands(commands, obj)
+
+                commands.append(
+                    ChangePropertyCommand(
+                        Collections.singleton(obj),
+                        "waterway",
+                        "stream"
+                    )
+                )
+
+                commands.append(
+                    ChangePropertyCommand(
+                        Collections.singleton(obj),
+                        "waterway:source",
+                        "no wikidata match"
+                    )
+                )
+
+                commands.append(
+                    ChangePropertyCommand(
+                        Collections.singleton(obj),
+                        "waterway:botcheck",
+                        "yes"
+                    )
+                )
+
+                summary_bits = [
+                    "waterway=stream",
+                    "waterway:source=no wikidata match",
+                    "waterway:botcheck=yes"
+                ]
+                summary_bits.extend(common_bits)
+
+                summary.append(
+                    "%s -> changed river -> stream ; %s"
+                    % (name, " ; ".join(summary_bits))
+                )
+
+            UndoRedoHandler.getInstance().add(
+                SequenceCommand("Japan waterway cleanup", commands)
+            )
+            command_count += 1
+
+        summary.insert(0, "Total objects changed: %s" % command_count)
+        summary.insert(1, "Skipped due to waterway:botcheck=yes: %s" % len(skipped))
+        summary.insert(2, "-" * 110)
+
+        show_summary_dialog(summary)
+
+    except Exception as e:
+        close_progress_dialog()
         show_summary_dialog([
-            "No selected river objects found to review.",
-            "Skipped due to waterway:botcheck=yes: %s" % len(skipped)
+            "Script stopped بسبب error." if False else "Script stopped because of an error.",
+            str(e)
         ])
-        return
-
-    preview.insert(0, "Total proposed changes: %s" % len(plan))
-    preview.insert(1, "Skipped due to waterway:botcheck=yes: %s" % len(skipped))
-    preview.insert(2, "-" * 110)
-
-    result = show_preview_dialog(preview)
-
-    if result != JOptionPane.OK_OPTION:
-        show_summary_dialog(["Operation cancelled. No changes applied."])
-        return
-
-    summary = []
-    command_count = 0
-
-    for item in plan:
-        commands = []
-
-        if item[0] == "match":
-            _, obj, qid, en_label, enwiki_title, jawiki_title = item
-            name = get_name(obj.getKeys())
-            common_bits = build_common_cleanup_summary_bits(obj)
-
-            append_common_cleanup_commands(commands, obj)
-
-            commands.append(
-                ChangePropertyCommand(
-                    Collections.singleton(obj),
-                    "wikidata",
-                    qid
-                )
-            )
-
-            if en_label:
-                commands.append(
-                    ChangePropertyCommand(
-                        Collections.singleton(obj),
-                        "name:en",
-                        en_label
-                    )
-                )
-
-            if enwiki_title:
-                commands.append(
-                    ChangePropertyCommand(
-                        Collections.singleton(obj),
-                        "wikipedia",
-                        "en:%s" % enwiki_title
-                    )
-                )
-
-            if jawiki_title:
-                commands.append(
-                    ChangePropertyCommand(
-                        Collections.singleton(obj),
-                        "wikipedia:ja",
-                        jawiki_title
-                    )
-                )
-
-            commands.append(
-                ChangePropertyCommand(
-                    Collections.singleton(obj),
-                    "waterway:botcheck",
-                    "yes"
-                )
-            )
-
-            summary_bits = ["wikidata=%s" % qid, "waterway:botcheck=yes"]
-
-            if en_label:
-                summary_bits.append("name:en=%s" % en_label)
-            if enwiki_title:
-                summary_bits.append("wikipedia=en:%s" % enwiki_title)
-            if jawiki_title:
-                summary_bits.append("wikipedia:ja=%s" % jawiki_title)
-
-            summary_bits.extend(common_bits)
-
-            summary.append(
-                "%s -> kept river ; %s"
-                % (name, " ; ".join(summary_bits))
-            )
-
-        else:
-            _, obj = item
-            name = get_name(obj.getKeys())
-            common_bits = build_common_cleanup_summary_bits(obj)
-
-            append_common_cleanup_commands(commands, obj)
-
-            commands.append(
-                ChangePropertyCommand(
-                    Collections.singleton(obj),
-                    "waterway",
-                    "stream"
-                )
-            )
-
-            commands.append(
-                ChangePropertyCommand(
-                    Collections.singleton(obj),
-                    "waterway:source",
-                    "no wikidata match"
-                )
-            )
-
-            commands.append(
-                ChangePropertyCommand(
-                    Collections.singleton(obj),
-                    "waterway:botcheck",
-                    "yes"
-                )
-            )
-
-            summary_bits = [
-                "waterway=stream",
-                "waterway:source=no wikidata match",
-                "waterway:botcheck=yes"
-            ]
-            summary_bits.extend(common_bits)
-
-            summary.append(
-                "%s -> changed river -> stream ; %s"
-                % (name, " ; ".join(summary_bits))
-            )
-
-        UndoRedoHandler.getInstance().add(
-            SequenceCommand("Japan waterway cleanup", commands)
-        )
-        command_count += 1
-
-    summary.insert(0, "Total objects changed: %s" % command_count)
-    summary.insert(1, "Skipped due to waterway:botcheck=yes: %s" % len(skipped))
-    summary.insert(2, "-" * 110)
-
-    show_summary_dialog(summary)
 
 
 process()
