@@ -10,6 +10,8 @@
 
 # JOSM Scripting Plugin - Python (Jython)
 # Japan waterway cleanup with:
+# - skip objects already marked waterway:botcheck=yes
+# - mark all reviewed objects with waterway:botcheck=yes
 # - unique name:ja grouping
 # - batched Wikidata entity fetches via wbgetentities
 # - caching
@@ -19,6 +21,12 @@
 # - preview + confirmation dialog
 # - matched objects get wikidata/name:en/wikipedia tags
 # - unmatched objects become stream + waterway:source=no wikidata match
+# - for all reviewed waterway=river objects:
+#     * delete level if level=-1
+#     * if source and source_ref both exist:
+#         source:name = old source
+#         source = old source_ref
+#         delete source_ref
 
 from java.net import URL, URLEncoder
 from java.io import BufferedReader, InputStreamReader
@@ -48,9 +56,14 @@ REQUEST_SLEEP_MS = 120
 MAX_RETRIES = 5
 ENTITY_BATCH_SIZE = 25
 
-SEARCH_CACHE = {}      # (name, lang) -> [candidate dicts]
-ENTITY_CACHE = {}      # qid -> entity dict
-GROUP_MATCH_CACHE = {} # exact name:ja -> entity or None
+SEARCH_CACHE = {}
+ENTITY_CACHE = {}
+GROUP_MATCH_CACHE = {}
+
+
+def should_skip(obj):
+    tags = obj.getKeys()
+    return tags.get("waterway:botcheck") == "yes"
 
 
 def sleep_ms(ms):
@@ -77,7 +90,7 @@ def http_get_json(url):
             conn = URL(url).openConnection()
             conn.setRequestProperty(
                 "User-Agent",
-                "JOSM Japan waterway matcher/1.3 (semi-automated cleanup)"
+                "JOSM Japan waterway matcher/1.6 (semi-automated cleanup)"
             )
             conn.setRequestProperty("Accept", "application/json")
             conn.setConnectTimeout(15000)
@@ -459,11 +472,29 @@ def get_name(tags):
     return "Unnamed waterway"
 
 
+def get_common_cleanup_preview_bits(obj):
+    bits = []
+    tags = obj.getKeys()
+
+    if tags.get("level") == "-1":
+        bits.append("delete level=-1")
+
+    if tags.containsKey("source") and tags.containsKey("source_ref"):
+        bits.append("rename source->source:name and source_ref->source")
+
+    return bits
+
+
 def group_objects(objs):
     grouped_by_name_ja = {}
     singles = []
+    skipped = []
 
     for obj in objs:
+        if should_skip(obj):
+            skipped.append(obj)
+            continue
+
         tags = obj.getKeys()
 
         if tags.get("waterway") != "river":
@@ -477,7 +508,7 @@ def group_objects(objs):
         else:
             singles.append(obj)
 
-    return grouped_by_name_ja, singles
+    return grouped_by_name_ja, singles, skipped
 
 
 def add_match_plan_entries(plan, preview, objs, entity, grouped_label=None):
@@ -486,28 +517,29 @@ def add_match_plan_entries(plan, preview, objs, entity, grouped_label=None):
     enwiki_title = get_sitelink_title(entity, "enwiki")
     jawiki_title = get_sitelink_title(entity, "jawiki")
 
-    preview_bits = ["wikidata=%s" % qid]
-
-    if en_label:
-        preview_bits.append("name:en=%s" % en_label)
-    if enwiki_title:
-        preview_bits.append("wikipedia=en:%s" % enwiki_title)
-    if jawiki_title:
-        preview_bits.append("wikipedia:ja=%s" % jawiki_title)
-
-    preview_text = " ; ".join(preview_bits)
-
     for obj in objs:
         name = get_name(obj.getKeys())
 
+        preview_bits = ["wikidata=%s" % qid, "waterway:botcheck=yes"]
+
+        if en_label:
+            preview_bits.append("name:en=%s" % en_label)
+        if enwiki_title:
+            preview_bits.append("wikipedia=en:%s" % enwiki_title)
+        if jawiki_title:
+            preview_bits.append("wikipedia:ja=%s" % jawiki_title)
+
+        preview_bits.extend(get_common_cleanup_preview_bits(obj))
+        preview_text = " ; ".join(preview_bits)
+
         if grouped_label is not None:
             preview.append(
-                "%s -> KEEP river ; add %s ; grouped by name:ja=%s"
+                "%s -> KEEP river ; add/change %s ; grouped by name:ja=%s"
                 % (name, preview_text, grouped_label)
             )
         else:
             preview.append(
-                "%s -> KEEP river ; add %s"
+                "%s -> KEEP river ; add/change %s"
                 % (name, preview_text)
             )
 
@@ -518,18 +550,80 @@ def add_nomatch_plan_entries(plan, preview, objs, grouped_label=None):
     for obj in objs:
         name = get_name(obj.getKeys())
 
+        preview_bits = [
+            "waterway=stream",
+            "waterway:source=no wikidata match",
+            "waterway:botcheck=yes"
+        ]
+        preview_bits.extend(get_common_cleanup_preview_bits(obj))
+        preview_text = " ; ".join(preview_bits)
+
         if grouped_label is not None:
             preview.append(
-                "%s -> CHANGE river -> stream ; add waterway:source=no wikidata match ; grouped by name:ja=%s"
-                % (name, grouped_label)
+                "%s -> CHANGE river -> stream ; add/change %s ; grouped by name:ja=%s"
+                % (name, preview_text, grouped_label)
             )
         else:
             preview.append(
-                "%s -> CHANGE river -> stream ; add waterway:source=no wikidata match"
-                % name
+                "%s -> CHANGE river -> stream ; add/change %s"
+                % (name, preview_text)
             )
 
         plan.append(("nomatch", obj))
+
+
+def append_common_cleanup_commands(commands, obj):
+    tags = obj.getKeys()
+
+    if tags.get("level") == "-1":
+        commands.append(
+            ChangePropertyCommand(
+                Collections.singleton(obj),
+                "level",
+                None
+            )
+        )
+
+    if tags.containsKey("source") and tags.containsKey("source_ref"):
+        old_source = tags.get("source")
+        old_source_ref = tags.get("source_ref")
+
+        commands.append(
+            ChangePropertyCommand(
+                Collections.singleton(obj),
+                "source:name",
+                old_source
+            )
+        )
+
+        commands.append(
+            ChangePropertyCommand(
+                Collections.singleton(obj),
+                "source",
+                old_source_ref
+            )
+        )
+
+        commands.append(
+            ChangePropertyCommand(
+                Collections.singleton(obj),
+                "source_ref",
+                None
+            )
+        )
+
+
+def build_common_cleanup_summary_bits(obj):
+    bits = []
+    tags = obj.getKeys()
+
+    if tags.get("level") == "-1":
+        bits.append("deleted level=-1")
+
+    if tags.containsKey("source") and tags.containsKey("source_ref"):
+        bits.append("changed source->source:name and source_ref->source")
+
+    return bits
 
 
 def process():
@@ -545,7 +639,7 @@ def process():
         show_summary_dialog(["No selected objects."])
         return
 
-    grouped_by_name_ja, singles = group_objects(selected)
+    grouped_by_name_ja, singles, skipped = group_objects(selected)
 
     plan = []
     preview = []
@@ -571,11 +665,15 @@ def process():
             add_nomatch_plan_entries(plan, preview, [obj])
 
     if not plan:
-        show_summary_dialog(["No selected river objects found."])
+        show_summary_dialog([
+            "No selected river objects found to review.",
+            "Skipped due to waterway:botcheck=yes: %s" % len(skipped)
+        ])
         return
 
     preview.insert(0, "Total proposed changes: %s" % len(plan))
-    preview.insert(1, "-" * 110)
+    preview.insert(1, "Skipped due to waterway:botcheck=yes: %s" % len(skipped))
+    preview.insert(2, "-" * 110)
 
     result = show_preview_dialog(preview)
 
@@ -592,6 +690,9 @@ def process():
         if item[0] == "match":
             _, obj, qid, en_label, enwiki_title, jawiki_title = item
             name = get_name(obj.getKeys())
+            common_bits = build_common_cleanup_summary_bits(obj)
+
+            append_common_cleanup_commands(commands, obj)
 
             commands.append(
                 ChangePropertyCommand(
@@ -628,7 +729,15 @@ def process():
                     )
                 )
 
-            summary_bits = ["wikidata=%s" % qid]
+            commands.append(
+                ChangePropertyCommand(
+                    Collections.singleton(obj),
+                    "waterway:botcheck",
+                    "yes"
+                )
+            )
+
+            summary_bits = ["wikidata=%s" % qid, "waterway:botcheck=yes"]
 
             if en_label:
                 summary_bits.append("name:en=%s" % en_label)
@@ -636,6 +745,8 @@ def process():
                 summary_bits.append("wikipedia=en:%s" % enwiki_title)
             if jawiki_title:
                 summary_bits.append("wikipedia:ja=%s" % jawiki_title)
+
+            summary_bits.extend(common_bits)
 
             summary.append(
                 "%s -> kept river ; %s"
@@ -645,6 +756,9 @@ def process():
         else:
             _, obj = item
             name = get_name(obj.getKeys())
+            common_bits = build_common_cleanup_summary_bits(obj)
+
+            append_common_cleanup_commands(commands, obj)
 
             commands.append(
                 ChangePropertyCommand(
@@ -662,9 +776,24 @@ def process():
                 )
             )
 
+            commands.append(
+                ChangePropertyCommand(
+                    Collections.singleton(obj),
+                    "waterway:botcheck",
+                    "yes"
+                )
+            )
+
+            summary_bits = [
+                "waterway=stream",
+                "waterway:source=no wikidata match",
+                "waterway:botcheck=yes"
+            ]
+            summary_bits.extend(common_bits)
+
             summary.append(
-                "%s -> changed river -> stream ; waterway:source=no wikidata match"
-                % name
+                "%s -> changed river -> stream ; %s"
+                % (name, " ; ".join(summary_bits))
             )
 
         UndoRedoHandler.getInstance().add(
@@ -673,7 +802,8 @@ def process():
         command_count += 1
 
     summary.insert(0, "Total objects changed: %s" % command_count)
-    summary.insert(1, "-" * 110)
+    summary.insert(1, "Skipped due to waterway:botcheck=yes: %s" % len(skipped))
+    summary.insert(2, "-" * 110)
 
     show_summary_dialog(summary)
 
