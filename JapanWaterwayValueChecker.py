@@ -10,7 +10,8 @@
 
 # JOSM Scripting Plugin - Python (Jython)
 # Japan waterway cleanup with:
-# - live progress dialog for Wikidata calls
+# - live progress dialog that updates while the script runs
+# - hard cap of 500 Wikidata lookup calls per run
 # - skip objects already marked waterway:botcheck=yes
 # - mark all reviewed objects with waterway:botcheck=yes
 # - unique name:ja grouping
@@ -32,11 +33,8 @@
 from java.net import URL, URLEncoder
 from java.io import BufferedReader, InputStreamReader
 from java.util import Collections
-from java.lang import Thread
-from javax.swing import (
-    JOptionPane, JTextArea, JScrollPane, JDialog,
-    SwingUtilities
-)
+from java.lang import Thread, Runnable
+from javax.swing import JOptionPane, JTextArea, JScrollPane, JDialog, SwingUtilities
 from java.awt import Dimension, BorderLayout
 from math import radians, sin, cos, sqrt, atan2
 import json
@@ -59,6 +57,7 @@ MAX_DISTANCE_KM = 100
 REQUEST_SLEEP_MS = 120
 MAX_RETRIES = 5
 ENTITY_BATCH_SIZE = 25
+MAX_WIKIDATA_LOOKUPS = 500
 
 SEARCH_CACHE = {}
 ENTITY_CACHE = {}
@@ -67,6 +66,154 @@ GROUP_MATCH_CACHE = {}
 PROGRESS_DIALOG = None
 PROGRESS_TEXT_AREA = None
 
+WIKIDATA_LOOKUP_COUNT = 0
+LOOKUP_LIMIT_REACHED = False
+
+
+# ----------------------------
+# EDT helpers
+# ----------------------------
+
+def run_on_edt_and_wait(runnable):
+    if SwingUtilities.isEventDispatchThread():
+        runnable.run()
+    else:
+        SwingUtilities.invokeAndWait(runnable)
+
+
+def run_on_edt_later(runnable):
+    if SwingUtilities.isEventDispatchThread():
+        runnable.run()
+    else:
+        SwingUtilities.invokeLater(runnable)
+
+
+# ----------------------------
+# UI helpers
+# ----------------------------
+
+def get_parent_component():
+    try:
+        return MainApplication.getMainFrame()
+    except:
+        return None
+
+
+class InitProgressDialogRunnable(Runnable):
+    def run(self):
+        global PROGRESS_DIALOG, PROGRESS_TEXT_AREA
+
+        PROGRESS_TEXT_AREA = JTextArea()
+        PROGRESS_TEXT_AREA.setEditable(False)
+        PROGRESS_TEXT_AREA.setLineWrap(False)
+
+        scroll = JScrollPane(PROGRESS_TEXT_AREA)
+        scroll.setPreferredSize(Dimension(950, 260))
+
+        PROGRESS_DIALOG = JDialog(get_parent_component(), "Wikidata Progress", False)
+        PROGRESS_DIALOG.getContentPane().setLayout(BorderLayout())
+        PROGRESS_DIALOG.getContentPane().add(scroll, BorderLayout.CENTER)
+        PROGRESS_DIALOG.pack()
+        PROGRESS_DIALOG.setLocationRelativeTo(get_parent_component())
+        PROGRESS_DIALOG.setVisible(True)
+
+
+class AppendProgressRunnable(Runnable):
+    def __init__(self, text):
+        self.text = text
+
+    def run(self):
+        global PROGRESS_TEXT_AREA
+        if PROGRESS_TEXT_AREA is None:
+            return
+
+        PROGRESS_TEXT_AREA.append(self.text + "\n")
+        PROGRESS_TEXT_AREA.setCaretPosition(
+            PROGRESS_TEXT_AREA.getDocument().getLength()
+        )
+        PROGRESS_TEXT_AREA.revalidate()
+        PROGRESS_TEXT_AREA.repaint()
+
+
+class CloseProgressDialogRunnable(Runnable):
+    def run(self):
+        global PROGRESS_DIALOG, PROGRESS_TEXT_AREA
+        if PROGRESS_DIALOG is not None:
+            PROGRESS_DIALOG.dispose()
+            PROGRESS_DIALOG = None
+        PROGRESS_TEXT_AREA = None
+
+
+class ShowConfirmDialogRunnable(Runnable):
+    def __init__(self, lines, title):
+        self.lines = lines
+        self.title = title
+        self.result = None
+
+    def run(self):
+        text_area = JTextArea("\n".join(self.lines))
+        text_area.setEditable(False)
+        text_area.setLineWrap(False)
+
+        scroll = JScrollPane(text_area)
+        scroll.setPreferredSize(Dimension(1100, 600))
+
+        self.result = JOptionPane.showConfirmDialog(
+            get_parent_component(),
+            scroll,
+            self.title,
+            JOptionPane.OK_CANCEL_OPTION,
+            JOptionPane.WARNING_MESSAGE
+        )
+
+
+class ShowMessageDialogRunnable(Runnable):
+    def __init__(self, lines, title):
+        self.lines = lines
+        self.title = title
+
+    def run(self):
+        text_area = JTextArea("\n".join(self.lines))
+        text_area.setEditable(False)
+        text_area.setLineWrap(False)
+
+        scroll = JScrollPane(text_area)
+        scroll.setPreferredSize(Dimension(1100, 600))
+
+        JOptionPane.showMessageDialog(
+            get_parent_component(),
+            scroll,
+            self.title,
+            JOptionPane.INFORMATION_MESSAGE
+        )
+
+
+def init_progress_dialog():
+    run_on_edt_and_wait(InitProgressDialogRunnable())
+
+
+def append_progress_line(text):
+    run_on_edt_later(AppendProgressRunnable(text))
+
+
+def close_progress_dialog():
+    run_on_edt_later(CloseProgressDialogRunnable())
+
+
+def show_preview_dialog(lines):
+    runnable = ShowConfirmDialogRunnable(lines, "Preview Proposed Waterway Changes")
+    run_on_edt_and_wait(runnable)
+    return runnable.result
+
+
+def show_summary_dialog(lines):
+    runnable = ShowMessageDialogRunnable(lines, "Applied Waterway Changes")
+    run_on_edt_and_wait(runnable)
+
+
+# ----------------------------
+# General helpers
+# ----------------------------
 
 def should_skip(obj):
     tags = obj.getKeys()
@@ -77,46 +224,12 @@ def sleep_ms(ms):
     Thread.sleep(ms)
 
 
-def get_parent_component():
-    try:
-        return MainApplication.getMainFrame()
-    except:
-        return None
-
-
-def init_progress_dialog():
-    global PROGRESS_DIALOG, PROGRESS_TEXT_AREA
-
-    PROGRESS_TEXT_AREA = JTextArea()
-    PROGRESS_TEXT_AREA.setEditable(False)
-    PROGRESS_TEXT_AREA.setLineWrap(False)
-
-    scroll = JScrollPane(PROGRESS_TEXT_AREA)
-    scroll.setPreferredSize(Dimension(950, 260))
-
-    PROGRESS_DIALOG = JDialog(get_parent_component(), "Wikidata Progress", False)
-    PROGRESS_DIALOG.getContentPane().setLayout(BorderLayout())
-    PROGRESS_DIALOG.getContentPane().add(scroll, BorderLayout.CENTER)
-    PROGRESS_DIALOG.pack()
-    PROGRESS_DIALOG.setLocationRelativeTo(get_parent_component())
-    PROGRESS_DIALOG.setVisible(True)
-
-
-def append_progress_line(text):
-    global PROGRESS_TEXT_AREA
-    if PROGRESS_TEXT_AREA is None:
-        return
-
-    PROGRESS_TEXT_AREA.append(text + "\n")
-    PROGRESS_TEXT_AREA.setCaretPosition(PROGRESS_TEXT_AREA.getDocument().getLength())
-    PROGRESS_TEXT_AREA.repaint()
-
-
-def close_progress_dialog():
-    global PROGRESS_DIALOG
-    if PROGRESS_DIALOG is not None:
-        PROGRESS_DIALOG.dispose()
-        PROGRESS_DIALOG = None
+def get_name(tags):
+    if tags.containsKey("name"):
+        return tags.get("name")
+    if tags.containsKey("name:ja"):
+        return tags.get("name:ja")
+    return "Unnamed waterway"
 
 
 def read_stream(stream):
@@ -130,19 +243,44 @@ def read_stream(stream):
     return "".join(lines)
 
 
+def can_make_lookup():
+    global LOOKUP_LIMIT_REACHED
+    if WIKIDATA_LOOKUP_COUNT >= MAX_WIKIDATA_LOOKUPS:
+        if not LOOKUP_LIMIT_REACHED:
+            LOOKUP_LIMIT_REACHED = True
+            append_progress_line(
+                "Lookup limit reached (%s). Stopping additional Wikidata requests for this run."
+                % MAX_WIKIDATA_LOOKUPS
+            )
+        return False
+    return True
+
+
+def register_lookup(log_label):
+    global WIKIDATA_LOOKUP_COUNT
+    WIKIDATA_LOOKUP_COUNT += 1
+    append_progress_line(
+        "[%s/%s] %s" % (WIKIDATA_LOOKUP_COUNT, MAX_WIKIDATA_LOOKUPS, log_label)
+    )
+
+
+# ----------------------------
+# HTTP / Wikidata helpers
+# ----------------------------
+
 def http_get_json(url, log_label=None):
     attempt = 0
     backoff_ms = 1000
 
     if log_label:
-        append_progress_line(log_label)
+        register_lookup(log_label)
 
     while attempt < MAX_RETRIES:
         try:
             conn = URL(url).openConnection()
             conn.setRequestProperty(
                 "User-Agent",
-                "JOSM Japan waterway matcher/1.7 (semi-automated cleanup)"
+                "JOSM Japan waterway matcher/2.0 (semi-automated cleanup)"
             )
             conn.setRequestProperty("Accept", "application/json")
             conn.setConnectTimeout(15000)
@@ -158,16 +296,18 @@ def http_get_json(url, log_label=None):
             elif code == 429:
                 retry_after = conn.getHeaderField("Retry-After")
                 wait_ms = backoff_ms
+
                 if retry_after is not None:
                     try:
                         wait_ms = int(retry_after) * 1000
                     except:
                         pass
+
                 append_progress_line(
                     "Wikidata rate-limited (429). Waiting %s ms before retry..." % wait_ms
                 )
                 sleep_ms(wait_ms)
-                backoff_ms = backoff_ms * 2
+                backoff_ms *= 2
                 attempt += 1
 
             elif code >= 500:
@@ -175,7 +315,7 @@ def http_get_json(url, log_label=None):
                     "Wikidata server error (%s). Retrying..." % code
                 )
                 sleep_ms(backoff_ms)
-                backoff_ms = backoff_ms * 2
+                backoff_ms *= 2
                 attempt += 1
 
             else:
@@ -192,7 +332,7 @@ def http_get_json(url, log_label=None):
                 raise
             append_progress_line("Request failed; retrying: %s" % str(e))
             sleep_ms(backoff_ms)
-            backoff_ms = backoff_ms * 2
+            backoff_ms *= 2
 
     raise Exception("Failed after retries for URL %s" % url)
 
@@ -201,6 +341,9 @@ def search_candidates(name, lang):
     key = (name, lang)
     if key in SEARCH_CACHE:
         return SEARCH_CACHE[key]
+
+    if not can_make_lookup():
+        return None
 
     encoded = URLEncoder.encode(name, "UTF-8")
     encoded_lang = URLEncoder.encode(lang, "UTF-8")
@@ -232,10 +375,13 @@ def get_entities_batch(qids):
             missing.append(qid)
 
     if not missing:
-        return
+        return True
 
     start = 0
     while start < len(missing):
+        if not can_make_lookup():
+            return False
+
         batch = missing[start:start + ENTITY_BATCH_SIZE]
         ids = "|".join(batch)
         encoded_ids = URLEncoder.encode(ids, "UTF-8")
@@ -262,6 +408,8 @@ def get_entities_batch(qids):
                 ENTITY_CACHE[qid] = entities[qid]
 
         start += ENTITY_BATCH_SIZE
+
+    return True
 
 
 def extract_claim_qids(entity, prop):
@@ -297,6 +445,25 @@ def get_sitelink_title(entity, site_key):
         return ""
 
 
+def label_value(entity, lang):
+    return entity.get("labels", {}).get(lang, {}).get("value", "")
+
+
+def aliases_values(entity, lang):
+    aliases = entity.get("aliases", {}).get(lang, [])
+    vals = []
+    for a in aliases:
+        try:
+            vals.append(a.get("value", ""))
+        except:
+            pass
+    return vals
+
+
+# ----------------------------
+# Geometry / scoring
+# ----------------------------
+
 def get_osm_center(obj):
     bbox = obj.getBBox()
     lat = (bbox.getTopLeftLat() + bbox.getBottomRightLat()) / 2.0
@@ -315,21 +482,6 @@ def haversine_km(lat1, lon1, lat2, lon2):
     )
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
-
-
-def label_value(entity, lang):
-    return entity.get("labels", {}).get(lang, {}).get("value", "")
-
-
-def aliases_values(entity, lang):
-    aliases = entity.get("aliases", {}).get(lang, [])
-    vals = []
-    for a in aliases:
-        try:
-            vals.append(a.get("value", ""))
-        except:
-            pass
-    return vals
 
 
 def score_candidate(entity, obj, group_name_ja=None):
@@ -386,6 +538,10 @@ def score_candidate(entity, obj, group_name_ja=None):
     return score
 
 
+# ----------------------------
+# Matching helpers
+# ----------------------------
+
 def build_search_names(tags):
     names = []
 
@@ -421,6 +577,9 @@ def find_best_match_for_obj(obj):
 
     for name, lang in search_names:
         candidates = search_candidates(name, lang)
+        if candidates is None:
+            return None, False
+
         for c in candidates:
             qid = c.get("id")
             if qid and qid not in seen_qids:
@@ -429,9 +588,11 @@ def find_best_match_for_obj(obj):
                 qids.append(qid)
 
     if not qids:
-        return None
+        return None, True
 
-    get_entities_batch(qids)
+    fetched = get_entities_batch(qids)
+    if not fetched:
+        return None, False
 
     best_score = -999
     best_entity = None
@@ -448,17 +609,19 @@ def find_best_match_for_obj(obj):
             best_entity = entity
 
     if best_score >= MIN_ACCEPT_SCORE:
-        return best_entity
+        return best_entity, True
 
-    return None
+    return None, True
 
 
 def find_best_match_for_group(name_ja, objs):
     if name_ja in GROUP_MATCH_CACHE:
-        return GROUP_MATCH_CACHE[name_ja]
+        return GROUP_MATCH_CACHE[name_ja], True
 
     sample_obj = objs[0]
     candidates = search_candidates(name_ja, "ja")
+    if candidates is None:
+        return None, False
 
     qids = []
     seen_qids = set()
@@ -471,9 +634,11 @@ def find_best_match_for_group(name_ja, objs):
 
     if not qids:
         GROUP_MATCH_CACHE[name_ja] = None
-        return None
+        return None, True
 
-    get_entities_batch(qids)
+    fetched = get_entities_batch(qids)
+    if not fetched:
+        return None, False
 
     best_score = -999
     best_entity = None
@@ -490,52 +655,15 @@ def find_best_match_for_group(name_ja, objs):
 
     if best_score >= MIN_ACCEPT_SCORE:
         GROUP_MATCH_CACHE[name_ja] = best_entity
-        return best_entity
+        return best_entity, True
 
     GROUP_MATCH_CACHE[name_ja] = None
-    return None
+    return None, True
 
 
-def show_preview_dialog(lines):
-    text_area = JTextArea("\n".join(lines))
-    text_area.setEditable(False)
-    text_area.setLineWrap(False)
-
-    scroll = JScrollPane(text_area)
-    scroll.setPreferredSize(Dimension(1100, 600))
-
-    return JOptionPane.showConfirmDialog(
-        None,
-        scroll,
-        "Preview Proposed Waterway Changes",
-        JOptionPane.OK_CANCEL_OPTION,
-        JOptionPane.WARNING_MESSAGE
-    )
-
-
-def show_summary_dialog(lines):
-    text_area = JTextArea("\n".join(lines))
-    text_area.setEditable(False)
-    text_area.setLineWrap(False)
-
-    scroll = JScrollPane(text_area)
-    scroll.setPreferredSize(Dimension(1100, 600))
-
-    JOptionPane.showMessageDialog(
-        None,
-        scroll,
-        "Applied Waterway Changes",
-        JOptionPane.INFORMATION_MESSAGE
-    )
-
-
-def get_name(tags):
-    if tags.containsKey("name"):
-        return tags.get("name")
-    if tags.containsKey("name:ja"):
-        return tags.get("name:ja")
-    return "Unnamed waterway"
-
+# ----------------------------
+# Planning helpers
+# ----------------------------
 
 def get_common_cleanup_preview_bits(obj):
     bits = []
@@ -546,6 +674,19 @@ def get_common_cleanup_preview_bits(obj):
 
     if tags.containsKey("source") and tags.containsKey("source_ref"):
         bits.append("rename source->source:name and source_ref->source")
+
+    return bits
+
+
+def build_common_cleanup_summary_bits(obj):
+    bits = []
+    tags = obj.getKeys()
+
+    if tags.get("level") == "-1":
+        bits.append("deleted level=-1")
+
+    if tags.containsKey("source") and tags.containsKey("source_ref"):
+        bits.append("changed source->source:name and source_ref->source")
 
     return bits
 
@@ -637,6 +778,10 @@ def add_nomatch_plan_entries(plan, preview, objs, grouped_label=None):
         plan.append(("nomatch", obj))
 
 
+# ----------------------------
+# Command helpers
+# ----------------------------
+
 def append_common_cleanup_commands(commands, obj):
     tags = obj.getKeys()
 
@@ -678,23 +823,11 @@ def append_common_cleanup_commands(commands, obj):
         )
 
 
-def build_common_cleanup_summary_bits(obj):
-    bits = []
-    tags = obj.getKeys()
+# ----------------------------
+# Main worker
+# ----------------------------
 
-    if tags.get("level") == "-1":
-        bits.append("deleted level=-1")
-
-    if tags.containsKey("source") and tags.containsKey("source_ref"):
-        bits.append("changed source->source:name and source_ref->source")
-
-    return bits
-
-
-def process():
-    init_progress_dialog()
-    append_progress_line("Starting review of selected waterways...")
-
+def run_script():
     try:
         layer = MainApplication.getLayerManager().getEditLayer()
 
@@ -714,6 +847,7 @@ def process():
 
         plan = []
         preview = []
+        unresolved_due_to_limit = 0
 
         group_keys = list(grouped_by_name_ja.keys())
         group_keys.sort()
@@ -721,13 +855,23 @@ def process():
         append_progress_line("Unique name:ja groups to resolve: %s" % len(group_keys))
         append_progress_line("Single unnamed-ja rivers to resolve individually: %s" % len(singles))
         append_progress_line("Skipped due to waterway:botcheck=yes: %s" % len(skipped))
+        append_progress_line("Lookup limit for this run: %s" % MAX_WIKIDATA_LOOKUPS)
 
         for name_ja in group_keys:
+            if LOOKUP_LIMIT_REACHED:
+                unresolved_due_to_limit += len(grouped_by_name_ja[name_ja])
+                continue
+
             objs = grouped_by_name_ja[name_ja]
             append_progress_line(
                 "Resolving grouped name:ja '%s' for %s object(s)..." % (name_ja, len(objs))
             )
-            match = find_best_match_for_group(name_ja, objs)
+
+            match, completed = find_best_match_for_group(name_ja, objs)
+
+            if not completed:
+                unresolved_due_to_limit += len(objs)
+                continue
 
             if match:
                 add_match_plan_entries(plan, preview, objs, match, grouped_label=name_ja)
@@ -735,10 +879,19 @@ def process():
                 add_nomatch_plan_entries(plan, preview, objs, grouped_label=name_ja)
 
         for obj in singles:
+            if LOOKUP_LIMIT_REACHED:
+                unresolved_due_to_limit += 1
+                continue
+
             append_progress_line(
                 "Resolving single object '%s'..." % get_name(obj.getKeys())
             )
-            match = find_best_match_for_obj(obj)
+
+            match, completed = find_best_match_for_obj(obj)
+
+            if not completed:
+                unresolved_due_to_limit += 1
+                continue
 
             if match:
                 add_match_plan_entries(plan, preview, [obj], match)
@@ -746,19 +899,32 @@ def process():
                 add_nomatch_plan_entries(plan, preview, [obj])
 
         append_progress_line("Finished Wikidata lookups.")
+        append_progress_line("Total actual Wikidata lookup calls: %s" % WIKIDATA_LOOKUP_COUNT)
 
         close_progress_dialog()
 
         if not plan:
-            show_summary_dialog([
+            lines = [
                 "No selected river objects found to review.",
-                "Skipped due to waterway:botcheck=yes: %s" % len(skipped)
-            ])
+                "Skipped due to waterway:botcheck=yes: %s" % len(skipped),
+                "Wikidata lookup calls made: %s" % WIKIDATA_LOOKUP_COUNT
+            ]
+            if unresolved_due_to_limit > 0:
+                lines.append(
+                    "Left untouched because lookup limit was reached: %s"
+                    % unresolved_due_to_limit
+                )
+            show_summary_dialog(lines)
             return
 
         preview.insert(0, "Total proposed changes: %s" % len(plan))
         preview.insert(1, "Skipped due to waterway:botcheck=yes: %s" % len(skipped))
-        preview.insert(2, "-" * 110)
+        preview.insert(2, "Wikidata lookup calls made: %s / %s" % (WIKIDATA_LOOKUP_COUNT, MAX_WIKIDATA_LOOKUPS))
+        if unresolved_due_to_limit > 0:
+            preview.insert(3, "Left untouched because lookup limit was reached: %s" % unresolved_due_to_limit)
+            preview.insert(4, "-" * 110)
+        else:
+            preview.insert(3, "-" * 110)
 
         result = show_preview_dialog(preview)
 
@@ -888,16 +1054,32 @@ def process():
 
         summary.insert(0, "Total objects changed: %s" % command_count)
         summary.insert(1, "Skipped due to waterway:botcheck=yes: %s" % len(skipped))
-        summary.insert(2, "-" * 110)
+        summary.insert(2, "Wikidata lookup calls made: %s / %s" % (WIKIDATA_LOOKUP_COUNT, MAX_WIKIDATA_LOOKUPS))
+        if unresolved_due_to_limit > 0:
+            summary.insert(3, "Left untouched because lookup limit was reached: %s" % unresolved_due_to_limit)
+            summary.insert(4, "-" * 110)
+        else:
+            summary.insert(3, "-" * 110)
 
         show_summary_dialog(summary)
 
     except Exception as e:
         close_progress_dialog()
         show_summary_dialog([
-            "Script stopped بسبب error." if False else "Script stopped because of an error.",
+            "Script stopped because of an error.",
             str(e)
         ])
+
+
+class WorkerRunnable(Runnable):
+    def run(self):
+        run_script()
+
+
+def process():
+    init_progress_dialog()
+    append_progress_line("Starting review of selected waterways...")
+    Thread(WorkerRunnable()).start()
 
 
 process()
