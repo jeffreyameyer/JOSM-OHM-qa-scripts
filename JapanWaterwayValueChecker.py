@@ -10,13 +10,13 @@
 
 # JOSM Scripting Plugin - Python (Jython)
 # Japan waterway cleanup with:
+# - SPARQL-first lookup for exact name:ja groups
+# - Action API fallback for unresolved names and non-name:ja objects
 # - live progress dialog that updates while the script runs
 # - hard cap of 500 Wikidata lookup calls per run
 # - skip objects already marked waterway:botcheck=yes
 # - mark all reviewed objects with waterway:botcheck=yes
 # - unique name:ja grouping
-# - batched Wikidata entity fetches via wbgetentities
-# - caching
 # - retry/backoff for HTTP 429
 # - type/country validation
 # - distance-based disambiguation
@@ -57,11 +57,15 @@ MAX_DISTANCE_KM = 100
 REQUEST_SLEEP_MS = 120
 MAX_RETRIES = 5
 ENTITY_BATCH_SIZE = 25
+SPARQL_NAME_BATCH_SIZE = 50
 MAX_WIKIDATA_LOOKUPS = 500
 
-SEARCH_CACHE = {}
-ENTITY_CACHE = {}
-GROUP_MATCH_CACHE = {}
+USER_AGENT = "OHMJapanWaterwayBot/3.1 (Jeff Meyer; jeff@openhistoricalmap.org; https://openhistoricalmap.org) JOSM-Jython"
+
+SEARCH_CACHE = {}          # (name, lang) -> [candidate search dicts]
+ENTITY_CACHE = {}          # qid -> normalized candidate dict
+GROUP_MATCH_CACHE = {}     # exact name:ja -> normalized candidate dict or None
+SPARQL_NAME_CACHE = {}     # exact name:ja -> [normalized candidate dicts]
 
 PROGRESS_DIALOG = None
 PROGRESS_TEXT_AREA = None
@@ -264,11 +268,42 @@ def register_lookup(log_label):
     )
 
 
+def escape_sparql_string(s):
+    return s.replace("\\", "\\\\").replace("\"", "\\\"")
+
+
+def parse_qid_from_uri(uri):
+    if uri is None:
+        return ""
+    idx = uri.rfind("/")
+    if idx >= 0:
+        return uri[idx + 1:]
+    return uri
+
+
+def parse_sparql_point_literal(point_str):
+    if point_str is None:
+        return None
+    s = point_str.strip()
+    if not s.startswith("Point(") or not s.endswith(")"):
+        return None
+    inner = s[6:-1].strip()
+    parts = inner.split(" ")
+    if len(parts) != 2:
+        return None
+    try:
+        lon = float(parts[0])
+        lat = float(parts[1])
+        return (lat, lon)
+    except:
+        return None
+
+
 # ----------------------------
 # HTTP / Wikidata helpers
 # ----------------------------
 
-def http_get_json(url, log_label=None):
+def http_get_json(url, log_label=None, accept_header="application/json"):
     attempt = 0
     backoff_ms = 1000
 
@@ -278,13 +313,10 @@ def http_get_json(url, log_label=None):
     while attempt < MAX_RETRIES:
         try:
             conn = URL(url).openConnection()
-            conn.setRequestProperty(
-                "User-Agent",
-                "JOSM Japan waterway matcher/2.0 (semi-automated cleanup)"
-            )
-            conn.setRequestProperty("Accept", "application/json")
+            conn.setRequestProperty("User-Agent", USER_AGENT)
+            conn.setRequestProperty("Accept", accept_header)
             conn.setConnectTimeout(15000)
-            conn.setReadTimeout(30000)
+            conn.setReadTimeout(45000)
 
             code = conn.getResponseCode()
 
@@ -337,6 +369,25 @@ def http_get_json(url, log_label=None):
     raise Exception("Failed after retries for URL %s" % url)
 
 
+def normalize_action_entity(entity):
+    normalized = {
+        "id": entity.get("id", ""),
+        "type_qids": extract_claim_qids_from_action(entity, "P31"),
+        "country_qids": extract_claim_qids_from_action(entity, "P17"),
+        "coord": extract_coords_from_action(entity),
+        "label_en": action_label_value(entity, "en"),
+        "label_ja": action_label_value(entity, "ja"),
+        "aliases_en": action_aliases_values(entity, "en"),
+        "aliases_ja": action_aliases_values(entity, "ja"),
+        "sitelinks": {
+            "enwiki": action_sitelink_title(entity, "enwiki"),
+            "jawiki": action_sitelink_title(entity, "jawiki")
+        },
+        "matched_name_ja": None
+    }
+    return normalized
+
+
 def search_candidates(name, lang):
     key = (name, lang)
     if key in SEARCH_CACHE:
@@ -361,7 +412,7 @@ def search_candidates(name, lang):
 
     data = http_get_json(
         url,
-        "Searching Wikidata for %s name=%s" % (lang, name)
+        "Action API search for %s name=%s" % (lang, name)
     )
     results = data.get("search", [])
     SEARCH_CACHE[key] = results
@@ -399,20 +450,20 @@ def get_entities_batch(qids):
 
         data = http_get_json(
             url,
-            "Fetching Wikidata entities batch: %s" % ids
+            "Action API entity batch: %s" % ids
         )
         entities = data.get("entities", {})
 
         for qid in batch:
             if qid in entities:
-                ENTITY_CACHE[qid] = entities[qid]
+                ENTITY_CACHE[qid] = normalize_action_entity(entities[qid])
 
         start += ENTITY_BATCH_SIZE
 
     return True
 
 
-def extract_claim_qids(entity, prop):
+def extract_claim_qids_from_action(entity, prop):
     claims = entity.get("claims", {}).get(prop, [])
     results = []
 
@@ -426,7 +477,7 @@ def extract_claim_qids(entity, prop):
     return results
 
 
-def extract_coords(entity):
+def extract_coords_from_action(entity):
     claims = entity.get("claims", {}).get("P625", [])
     if not claims:
         return None
@@ -438,18 +489,18 @@ def extract_coords(entity):
         return None
 
 
-def get_sitelink_title(entity, site_key):
+def action_sitelink_title(entity, site_key):
     try:
         return entity.get("sitelinks", {}).get(site_key, {}).get("title", "")
     except:
         return ""
 
 
-def label_value(entity, lang):
+def action_label_value(entity, lang):
     return entity.get("labels", {}).get(lang, {}).get("value", "")
 
 
-def aliases_values(entity, lang):
+def action_aliases_values(entity, lang):
     aliases = entity.get("aliases", {}).get(lang, [])
     vals = []
     for a in aliases:
@@ -458,6 +509,137 @@ def aliases_values(entity, lang):
         except:
             pass
     return vals
+
+
+# ----------------------------
+# SPARQL helpers
+# ----------------------------
+
+def make_sparql_candidates_for_names(name_batch):
+    if not name_batch:
+        return {}
+
+    unresolved = []
+    for n in name_batch:
+        if n not in SPARQL_NAME_CACHE:
+            unresolved.append(n)
+
+    if not unresolved:
+        result = {}
+        for n in name_batch:
+            result[n] = SPARQL_NAME_CACHE.get(n, [])
+        return result
+
+    if not can_make_lookup():
+        return None
+
+    values_parts = []
+    for n in unresolved:
+        values_parts.append("\"%s\"" % escape_sparql_string(n))
+    values_block = " ".join(values_parts)
+
+    query = """
+SELECT ?needle ?item ?coord ?country ?itemLabelEn ?itemLabelJa ?enwikiTitle ?jawikiTitle WHERE {
+  VALUES ?needle { %s }
+
+  ?item (rdfs:label|skos:altLabel) ?needle .
+  FILTER(LANG(?needle) = "ja")
+
+  ?item wdt:P31 ?type .
+  VALUES ?type { wd:Q4022 wd:Q47521 wd:Q355304 }
+
+  OPTIONAL { ?item wdt:P625 ?coord }
+  OPTIONAL { ?item wdt:P17 ?country }
+
+  OPTIONAL {
+    ?item rdfs:label ?itemLabelEn .
+    FILTER(LANG(?itemLabelEn) = "en")
+  }
+
+  OPTIONAL {
+    ?item rdfs:label ?itemLabelJa .
+    FILTER(LANG(?itemLabelJa) = "ja")
+  }
+
+  OPTIONAL {
+    ?articleEn schema:about ?item ;
+               schema:isPartOf <https://en.wikipedia.org/> ;
+               schema:name ?enwikiTitle .
+  }
+
+  OPTIONAL {
+    ?articleJa schema:about ?item ;
+               schema:isPartOf <https://ja.wikipedia.org/> ;
+               schema:name ?jawikiTitle .
+  }
+}
+""" % values_block
+
+    encoded_query = URLEncoder.encode(query, "UTF-8")
+    url = "https://query.wikidata.org/sparql?format=json&query=%s" % encoded_query
+
+    data = http_get_json(
+        url,
+        "WDQS batch for %s unique name:ja values" % len(unresolved),
+        "application/sparql-results+json, application/json"
+    )
+
+    bindings = data.get("results", {}).get("bindings", [])
+
+    grouped = {}
+    for n in unresolved:
+        grouped[n] = []
+
+    seen_by_name = {}
+
+    for row in bindings:
+        try:
+            needle = row.get("needle", {}).get("value", "")
+            item_uri = row.get("item", {}).get("value", "")
+            qid = parse_qid_from_uri(item_uri)
+            if not needle or not qid:
+                continue
+
+            dedupe_key = needle + "||" + qid
+            if dedupe_key in seen_by_name:
+                continue
+            seen_by_name[dedupe_key] = True
+
+            coord = None
+            if "coord" in row:
+                coord = parse_sparql_point_literal(row["coord"]["value"])
+
+            country_qids = []
+            if "country" in row:
+                country_qids.append(parse_qid_from_uri(row["country"]["value"]))
+
+            candidate = {
+                "id": qid,
+                "type_qids": list(VALID_TYPES),
+                "country_qids": country_qids,
+                "coord": coord,
+                "label_en": row.get("itemLabelEn", {}).get("value", ""),
+                "label_ja": row.get("itemLabelJa", {}).get("value", ""),
+                "aliases_en": [],
+                "aliases_ja": [],
+                "sitelinks": {
+                    "enwiki": row.get("enwikiTitle", {}).get("value", ""),
+                    "jawiki": row.get("jawikiTitle", {}).get("value", "")
+                },
+                "matched_name_ja": needle
+            }
+
+            grouped.setdefault(needle, []).append(candidate)
+        except:
+            pass
+
+    for n in unresolved:
+        SPARQL_NAME_CACHE[n] = grouped.get(n, [])
+
+    result = {}
+    for n in name_batch:
+        result[n] = SPARQL_NAME_CACHE.get(n, [])
+    return result
 
 
 # ----------------------------
@@ -484,34 +666,33 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return R * c
 
 
-def score_candidate(entity, obj, group_name_ja=None):
+def score_candidate(candidate, obj, group_name_ja=None):
     score = 0
 
-    p31 = extract_claim_qids(entity, "P31")
-    if not any(q in VALID_TYPES for q in p31):
+    if not any(q in VALID_TYPES for q in candidate.get("type_qids", [])):
         return -999
 
     score += 5
 
-    countries = extract_claim_qids(entity, "P17")
-    if JAPAN_QID in countries:
+    if JAPAN_QID in candidate.get("country_qids", []):
         score += 4
 
     tags = obj.getKeys()
 
-    ja_label = label_value(entity, "ja")
-    en_label = label_value(entity, "en")
-    ja_aliases = aliases_values(entity, "ja")
-    en_aliases = aliases_values(entity, "en")
+    ja_label = candidate.get("label_ja", "")
+    en_label = candidate.get("label_en", "")
+    ja_aliases = candidate.get("aliases_ja", [])
+    en_aliases = candidate.get("aliases_en", [])
+    matched_name_ja = candidate.get("matched_name_ja")
 
     if group_name_ja is not None:
-        if group_name_ja == ja_label:
+        if group_name_ja == matched_name_ja or group_name_ja == ja_label:
             score += 6
         elif group_name_ja in ja_aliases:
             score += 5
     elif tags.containsKey("name:ja"):
         name_ja = tags.get("name:ja")
-        if name_ja == ja_label:
+        if name_ja == matched_name_ja or name_ja == ja_label:
             score += 6
         elif name_ja in ja_aliases:
             score += 5
@@ -523,7 +704,7 @@ def score_candidate(entity, obj, group_name_ja=None):
         elif name in en_aliases:
             score += 2
 
-    wd_coords = extract_coords(entity)
+    wd_coords = candidate.get("coord")
     if wd_coords:
         osm_lat, osm_lon = get_osm_center(obj)
         dist = haversine_km(osm_lat, osm_lon, wd_coords[0], wd_coords[1])
@@ -584,7 +765,6 @@ def find_best_match_for_obj(obj):
             qid = c.get("id")
             if qid and qid not in seen_qids:
                 seen_qids.add(qid)
-                all_candidates.append(c)
                 qids.append(qid)
 
     if not qids:
@@ -594,30 +774,27 @@ def find_best_match_for_obj(obj):
     if not fetched:
         return None, False
 
+    for qid in qids:
+        candidate = ENTITY_CACHE.get(qid)
+        if candidate:
+            all_candidates.append(candidate)
+
     best_score = -999
-    best_entity = None
+    best_candidate = None
 
-    for c in all_candidates:
-        qid = c.get("id")
-        entity = ENTITY_CACHE.get(qid)
-        if entity is None:
-            continue
-
-        score = score_candidate(entity, obj)
+    for candidate in all_candidates:
+        score = score_candidate(candidate, obj)
         if score > best_score:
             best_score = score
-            best_entity = entity
+            best_candidate = candidate
 
     if best_score >= MIN_ACCEPT_SCORE:
-        return best_entity, True
+        return best_candidate, True
 
     return None, True
 
 
-def find_best_match_for_group(name_ja, objs):
-    if name_ja in GROUP_MATCH_CACHE:
-        return GROUP_MATCH_CACHE[name_ja], True
-
+def find_best_match_for_group_via_action(name_ja, objs):
     sample_obj = objs[0]
     candidates = search_candidates(name_ja, "ja")
     if candidates is None:
@@ -633,7 +810,6 @@ def find_best_match_for_group(name_ja, objs):
             qids.append(qid)
 
     if not qids:
-        GROUP_MATCH_CACHE[name_ja] = None
         return None, True
 
     fetched = get_entities_batch(qids)
@@ -641,24 +817,40 @@ def find_best_match_for_group(name_ja, objs):
         return None, False
 
     best_score = -999
-    best_entity = None
+    best_candidate = None
 
     for qid in qids:
-        entity = ENTITY_CACHE.get(qid)
-        if entity is None:
+        candidate = ENTITY_CACHE.get(qid)
+        if candidate is None:
             continue
 
-        score = score_candidate(entity, sample_obj, group_name_ja=name_ja)
+        score = score_candidate(candidate, sample_obj, group_name_ja=name_ja)
         if score > best_score:
             best_score = score
-            best_entity = entity
+            best_candidate = candidate
 
     if best_score >= MIN_ACCEPT_SCORE:
-        GROUP_MATCH_CACHE[name_ja] = best_entity
-        return best_entity, True
+        return best_candidate, True
 
-    GROUP_MATCH_CACHE[name_ja] = None
     return None, True
+
+
+def find_best_match_for_group_from_candidates(name_ja, objs, candidates):
+    sample_obj = objs[0]
+
+    best_score = -999
+    best_candidate = None
+
+    for candidate in candidates:
+        score = score_candidate(candidate, sample_obj, group_name_ja=name_ja)
+        if score > best_score:
+            best_score = score
+            best_candidate = candidate
+
+    if best_score >= MIN_ACCEPT_SCORE:
+        return best_candidate
+
+    return None
 
 
 # ----------------------------
@@ -717,11 +909,11 @@ def group_objects(objs):
     return grouped_by_name_ja, singles, skipped
 
 
-def add_match_plan_entries(plan, preview, objs, entity, grouped_label=None):
-    qid = entity["id"]
-    en_label = label_value(entity, "en")
-    enwiki_title = get_sitelink_title(entity, "enwiki")
-    jawiki_title = get_sitelink_title(entity, "jawiki")
+def add_match_plan_entries(plan, preview, objs, candidate, grouped_label=None):
+    qid = candidate["id"]
+    en_label = candidate.get("label_en", "")
+    enwiki_title = candidate.get("sitelinks", {}).get("enwiki", "")
+    jawiki_title = candidate.get("sitelinks", {}).get("jawiki", "")
 
     for obj in objs:
         name = get_name(obj.getKeys())
@@ -857,26 +1049,64 @@ def run_script():
         append_progress_line("Skipped due to waterway:botcheck=yes: %s" % len(skipped))
         append_progress_line("Lookup limit for this run: %s" % MAX_WIKIDATA_LOOKUPS)
 
-        for name_ja in group_keys:
+        idx = 0
+        while idx < len(group_keys):
             if LOOKUP_LIMIT_REACHED:
-                unresolved_due_to_limit += len(grouped_by_name_ja[name_ja])
-                continue
+                for j in range(idx, len(group_keys)):
+                    unresolved_due_to_limit += len(grouped_by_name_ja[group_keys[j]])
+                break
 
-            objs = grouped_by_name_ja[name_ja]
+            batch_names = group_keys[idx:idx + SPARQL_NAME_BATCH_SIZE]
             append_progress_line(
-                "Resolving grouped name:ja '%s' for %s object(s)..." % (name_ja, len(objs))
+                "WDQS resolving %s exact name:ja values..." % len(batch_names)
             )
 
-            match, completed = find_best_match_for_group(name_ja, objs)
-
-            if not completed:
-                unresolved_due_to_limit += len(objs)
+            batch_candidates = make_sparql_candidates_for_names(batch_names)
+            if batch_candidates is None:
+                for name_ja in batch_names:
+                    unresolved_due_to_limit += len(grouped_by_name_ja[name_ja])
+                idx += SPARQL_NAME_BATCH_SIZE
                 continue
 
-            if match:
-                add_match_plan_entries(plan, preview, objs, match, grouped_label=name_ja)
-            else:
-                add_nomatch_plan_entries(plan, preview, objs, grouped_label=name_ja)
+            for name_ja in batch_names:
+                objs = grouped_by_name_ja[name_ja]
+
+                if name_ja in GROUP_MATCH_CACHE:
+                    cached = GROUP_MATCH_CACHE[name_ja]
+                    if cached:
+                        add_match_plan_entries(plan, preview, objs, cached, grouped_label=name_ja)
+                    else:
+                        add_nomatch_plan_entries(plan, preview, objs, grouped_label=name_ja)
+                    continue
+
+                candidates = batch_candidates.get(name_ja, [])
+                match = None
+
+                if candidates:
+                    append_progress_line(
+                        "Scoring WDQS candidates for '%s' (%s object(s), %s candidate(s))..."
+                        % (name_ja, len(objs), len(candidates))
+                    )
+                    match = find_best_match_for_group_from_candidates(name_ja, objs, candidates)
+
+                if match is None:
+                    append_progress_line(
+                        "No accepted WDQS match for '%s'; falling back to Action API..."
+                        % name_ja
+                    )
+                    match, completed = find_best_match_for_group_via_action(name_ja, objs)
+                    if not completed:
+                        unresolved_due_to_limit += len(objs)
+                        continue
+
+                GROUP_MATCH_CACHE[name_ja] = match
+
+                if match:
+                    add_match_plan_entries(plan, preview, objs, match, grouped_label=name_ja)
+                else:
+                    add_nomatch_plan_entries(plan, preview, objs, grouped_label=name_ja)
+
+            idx += SPARQL_NAME_BATCH_SIZE
 
         for obj in singles:
             if LOOKUP_LIMIT_REACHED:
@@ -884,7 +1114,7 @@ def run_script():
                 continue
 
             append_progress_line(
-                "Resolving single object '%s'..." % get_name(obj.getKeys())
+                "Resolving single object '%s' via Action API..." % get_name(obj.getKeys())
             )
 
             match, completed = find_best_match_for_obj(obj)
